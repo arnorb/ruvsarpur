@@ -1,6 +1,7 @@
 // frontend/src/App.tsx
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Check, Clapperboard, Download, Film, Plus, RefreshCw, Search, Settings, Tv, Volleyball } from "lucide-react";
+import { ArrowLeft, Check, Clapperboard, Download, Film, Plus, RefreshCw, Search, Settings, Tv, Volleyball } from "lucide-react";
+import { useNavigate, useParams } from "react-router-dom";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 
@@ -155,6 +156,9 @@ function getEpisodeDescription(show: ShowItem): string | null {
 }
 
 export default function App() {
+  const navigate = useNavigate();
+  const { sid: routeSid } = useParams<{ sid?: string }>();
+  const selectedSid = routeSid ?? null;
   const [query, setQuery] = useState("");
   const [shows, setShows] = useState<ShowItem[]>([]);
   const [isLoading, setIsLoading] = useState(false);
@@ -164,7 +168,6 @@ export default function App() {
   const [currentPage, setCurrentPage] = useState(1);
   const [viewMode, setViewMode] = useState<"list" | "poster">("poster");
   const [contentFilter, setContentFilter] = useState<"movie_or_docu" | "sport" | "show">("show");
-  const [selectedSid, setSelectedSid] = useState<string | null>(null);
   const [showAutomationSettings, setShowAutomationSettings] = useState(false);
   const [imageLoadFailed, setImageLoadFailed] = useState<Record<string, boolean>>({});
   const [settings, setSettings] = useState<AutoSettings>({
@@ -243,18 +246,22 @@ export default function App() {
   const pageEndIndex = Math.min(currentPage * PAGE_SIZE, totalItemsForView);
   const episodesForSelectedSid = useMemo(() => {
     if (!selectedSid) return [];
-    return shows
-      .filter((show) => show.sid === selectedSid)
-      .sort((a, b) => new Date(b.publishedAt).getTime() - new Date(a.publishedAt).getTime());
-  }, [selectedSid, shows]);
+    return groupedAllShows.find(([sid]) => sid === selectedSid)?.[1] ?? [];
+  }, [selectedSid, groupedAllShows]);
   const selectedSidFollowed = useMemo(() => {
-    if (!selectedSid) return false;
-    return shows.some((show) => show.sid === selectedSid && show.isFollowed);
-  }, [selectedSid, shows]);
+    if (episodesForSelectedSid.length === 0) return false;
+    return isSidFollowed(episodesForSelectedSid);
+  }, [episodesForSelectedSid]);
   const selectedSidDescription = useMemo(
     () => getGroupDescription(episodesForSelectedSid),
     [episodesForSelectedSid],
   );
+  const selectedSidPosterUrl = useMemo(() => getGroupPosterUrl(episodesForSelectedSid), [episodesForSelectedSid]);
+  const selectedContentType = useMemo(
+    () => getGroupContentType(episodesForSelectedSid),
+    [episodesForSelectedSid],
+  );
+  const selectedPrimaryItem = useMemo(() => episodesForSelectedSid[0] ?? null, [episodesForSelectedSid]);
   const followedCount = useMemo(() => shows.filter((show) => show.isFollowed).length, [shows]);
 
   const startRefreshTicker = () => {
@@ -316,9 +323,8 @@ export default function App() {
       }
       setShows(data.shows ?? []);
       setCurrentPage(1);
-      setSelectedSid(null);
       setImageLoadFailed({});
-      setStatusMessage(`Loaded ${data.shows?.length ?? 0} show(s).`);
+      setStatusMessage("");
     } catch (error) {
       const message = error instanceof Error ? error.message : "Unexpected error while loading shows";
       setErrorMessage(message);
@@ -395,6 +401,25 @@ export default function App() {
   const changePage = (nextPage: number) => {
     setCurrentPage(nextPage);
     window.scrollTo({ top: 0, behavior: "smooth" });
+  };
+
+  const openDetailsPage = (sid: string) => {
+    navigate(`/title/${encodeURIComponent(sid)}`);
+  };
+
+  const closeDetailsPage = () => {
+    if (window.history.length > 1) {
+      navigate(-1);
+      return;
+    }
+    navigate("/");
+  };
+
+  const handleSidebarSelect = (nextFilter: "movie_or_docu" | "sport" | "show") => {
+    setContentFilter(nextFilter);
+    if (selectedSid) {
+      navigate("/");
+    }
   };
 
   const toggleFollowSid = async (sid: string, follow: boolean) => {
@@ -524,7 +549,7 @@ export default function App() {
           {sidebarNav.map(({ key, label, icon }) => (
             <button
               key={key}
-              onClick={() => setContentFilter(key)}
+              onClick={() => handleSidebarSelect(key)}
               className={`flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-sm font-medium transition-colors ${
                 contentFilter === key
                   ? "bg-sky-600/20 text-sky-300"
@@ -558,7 +583,7 @@ export default function App() {
             <Input
               value={query}
               onChange={(event) => setQuery(event.target.value)}
-              placeholder="Search by title, SID, or PID"
+              placeholder="Search by title"
               className="h-9 border-0 bg-transparent text-slate-100 placeholder:text-slate-500 focus-visible:ring-0 focus-visible:ring-offset-0"
               onKeyDown={(event) => {
                 if (event.key === "Enter") void loadShows(false);
@@ -653,8 +678,168 @@ export default function App() {
             </p>
           ) : null}
 
-          <div className={viewMode === "poster" ? "" : "rounded-lg border border-slate-800 bg-slate-900/60"}>
-            {shows.length === 0 ? (
+          <div className={viewMode === "poster" || selectedSid ? "" : "rounded-lg border border-slate-800 bg-slate-900/60"}>
+            {selectedSid ? (
+              <section className="space-y-4">
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="border-slate-700 bg-slate-800 text-slate-200 hover:bg-slate-700"
+                  onClick={closeDetailsPage}
+                >
+                  <ArrowLeft className="mr-2 h-4 w-4" />
+                  Back
+                </Button>
+
+                <div className="grid gap-4 rounded-xl border border-slate-800 bg-slate-900/60 p-4 md:grid-cols-[220px_1fr]">
+                  <div className="mx-auto w-full max-w-[220px]">
+                    <div className="relative aspect-2/3 overflow-hidden rounded-lg border border-slate-800 bg-slate-800">
+                      {selectedSidPosterUrl && !imageLoadFailed[selectedSid] ? (
+                        <img
+                          src={selectedSidPosterUrl}
+                          alt={`${getGroupTitle(episodesForSelectedSid)} poster`}
+                          className="h-full w-full object-cover"
+                          loading="lazy"
+                          onError={() => setImageLoadFailed((current) => ({ ...current, [selectedSid]: true }))}
+                        />
+                      ) : (
+                        <div className="flex h-full w-full items-center justify-center text-xs font-medium text-slate-500">
+                          No image
+                        </div>
+                      )}
+                    </div>
+                  </div>
+
+                  <div className="min-w-0">
+                    <div className="mb-3 flex flex-wrap items-start justify-between gap-3">
+                      <div className="min-w-0">
+                        <p className="text-xl font-semibold text-slate-100">{getGroupTitle(episodesForSelectedSid)}</p>
+                        <p className="text-sm text-slate-400">
+                          {CONTENT_GROUP_LABEL[getGroupContentType(episodesForSelectedSid)]} - {episodesForSelectedSid.length}{" "}
+                          episode(s)
+                        </p>
+                      </div>
+                      <Button
+                        size="sm"
+                        className={
+                          selectedSidFollowed
+                            ? "border border-sky-600/60 bg-sky-600/80 text-sky-50 hover:bg-rose-600/80 hover:border-rose-600/60 hover:text-rose-50"
+                            : "border-slate-700 bg-slate-800 text-slate-200 hover:bg-slate-700"
+                        }
+                        onClick={() => void toggleFollowSid(selectedSid, !selectedSidFollowed)}
+                      >
+                        {selectedSidFollowed ? (
+                          <>
+                            <Check className="mr-2 h-4 w-4" />
+                            Following
+                          </>
+                        ) : (
+                          <>
+                            <Plus className="mr-2 h-4 w-4" />
+                            Follow
+                          </>
+                        )}
+                      </Button>
+                    </div>
+
+                    {selectedContentType === "movie_or_docu" && selectedPrimaryItem ? (
+                      <div className="mb-4 space-y-3">
+                        <p className="text-sm text-slate-500">Air date: {formatDate(selectedPrimaryItem.publishedAt)}</p>
+                        {getEpisodeDescription(selectedPrimaryItem) ? (
+                          <p className="text-sm leading-relaxed text-slate-300">
+                            {getEpisodeDescription(selectedPrimaryItem)}
+                          </p>
+                        ) : null}
+                        <div className="flex items-center gap-2">
+                          <Button
+                            variant="secondary"
+                            size="sm"
+                            onClick={() => void handleDownload(selectedPrimaryItem, "web")}
+                            disabled={isDownloading !== null}
+                            className="relative h-8 overflow-hidden border border-sky-600/60 bg-sky-600/90 text-sky-50 hover:bg-sky-500"
+                          >
+                            <span
+                              className="absolute bottom-0 left-0 h-1 bg-sky-200/50 transition-[width] duration-200"
+                              style={{ width: `${downloadProgress[selectedPrimaryItem.pid] ?? 0}%` }}
+                            />
+                            <Download className="mr-2 h-4 w-4" />
+                            {isDownloading === selectedPrimaryItem.pid ? "Downloading..." : "Download"}
+                          </Button>
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            onClick={() => void handleDownload(selectedPrimaryItem, "library")}
+                            disabled={isDownloading !== null}
+                            className="relative h-7 border-slate-700 bg-slate-800 px-2 text-xs text-slate-200 hover:bg-slate-700"
+                          >
+                            <span
+                              className="absolute bottom-0 left-0 h-1 bg-sky-500/60 transition-[width] duration-200"
+                              style={{ width: `${downloadProgress[selectedPrimaryItem.pid] ?? 0}%` }}
+                            />
+                            {isDownloading === selectedPrimaryItem.pid ? "..." : "Library"}
+                          </Button>
+                        </div>
+                      </div>
+                    ) : selectedSidDescription ? (
+                      <section className="mb-4 rounded-md border border-slate-800 bg-slate-900/70 p-3">
+                        <p className="mb-1 text-xs font-semibold uppercase tracking-wide text-slate-400">Description</p>
+                        <p className="text-sm leading-relaxed text-slate-300">{selectedSidDescription}</p>
+                      </section>
+                    ) : null}
+
+                    {episodesForSelectedSid.length === 0 ? (
+                      <p className="text-sm text-slate-500">No episodes found for this title.</p>
+                    ) : selectedContentType !== "movie_or_docu" ? (
+                      <ul className="space-y-2">
+                        {episodesForSelectedSid.map((episode) => (
+                          <li
+                            key={episode.pid}
+                            className="flex items-center justify-between gap-3 rounded-md border border-slate-800 bg-slate-900/70 p-3"
+                          >
+                            <div className="min-w-0 flex-1">
+                              <p className="truncate font-medium text-slate-100">{episode.title}</p>
+                              <p className="text-sm text-slate-500">{formatDate(episode.publishedAt)}</p>
+                              {getEpisodeDescription(episode) ? (
+                                <p className="mt-1 line-clamp-3 text-sm text-slate-300">{getEpisodeDescription(episode)}</p>
+                              ) : null}
+                            </div>
+                            <div className="flex items-center gap-2">
+                              <Button
+                                variant="secondary"
+                                size="sm"
+                                onClick={() => void handleDownload(episode, "web")}
+                                disabled={isDownloading !== null}
+                                className="relative h-8 overflow-hidden border border-sky-600/60 bg-sky-600/90 text-sky-50 hover:bg-sky-500"
+                              >
+                                <span
+                                  className="absolute bottom-0 left-0 h-1 bg-sky-200/50 transition-[width] duration-200"
+                                  style={{ width: `${downloadProgress[episode.pid] ?? 0}%` }}
+                                />
+                                <Download className="mr-2 h-4 w-4" />
+                                {isDownloading === episode.pid ? "Downloading..." : "Download"}
+                              </Button>
+                              <Button
+                                variant="outline"
+                                size="sm"
+                                onClick={() => void handleDownload(episode, "library")}
+                                disabled={isDownloading !== null}
+                                className="relative h-7 border-slate-700 bg-slate-800 px-2 text-xs text-slate-200 hover:bg-slate-700"
+                              >
+                                <span
+                                  className="absolute bottom-0 left-0 h-1 bg-sky-500/60 transition-[width] duration-200"
+                                  style={{ width: `${downloadProgress[episode.pid] ?? 0}%` }}
+                                />
+                                {isDownloading === episode.pid ? "..." : "Library"}
+                              </Button>
+                            </div>
+                          </li>
+                        ))}
+                      </ul>
+                    ) : null}
+                  </div>
+                </div>
+              </section>
+            ) : shows.length === 0 ? (
               <p className="p-4 text-sm text-slate-400">
                 {hasQuery ? "No results for your search." : "No shows returned from backend."}
               </p>
@@ -698,9 +883,7 @@ export default function App() {
                                 >
                                   <div className="min-w-0 flex-1">
                                     <p className="truncate font-medium text-slate-100">{show.title}</p>
-                                    <p className="text-xs text-slate-500">
-                                      PID {show.pid} - {formatDate(show.publishedAt)}
-                                    </p>
+                                    <p className="text-xs text-slate-500">{formatDate(show.publishedAt)}</p>
                                   </div>
 
                                   <div className="flex items-center gap-2">
@@ -753,7 +936,7 @@ export default function App() {
                             <li
                               key={sid}
                               className="group cursor-pointer transition-transform hover:-translate-y-0.5"
-                              onClick={() => setSelectedSid(sid)}
+                              onClick={() => openDetailsPage(sid)}
                             >
                               <div className="relative aspect-2/3 overflow-hidden rounded-lg bg-slate-800">
                                 {getGroupPosterUrl(sidShows) && !imageLoadFailed[sid] ? (
@@ -812,7 +995,7 @@ export default function App() {
             )}
           </div>
 
-          {shows.length > 0 ? (
+          {shows.length > 0 && !selectedSid ? (
             <div className="mt-6 flex flex-wrap items-center justify-between gap-3">
               <p className="text-sm text-slate-400">
                 Showing {pageStartIndex}–{pageEndIndex} of {totalItemsForView}
@@ -982,113 +1165,6 @@ export default function App() {
         </div>
       ) : null}
 
-      {selectedSid ? (
-        <div
-          className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4 backdrop-blur-sm"
-          onClick={() => setSelectedSid(null)}
-        >
-          <div
-            className="max-h-[80vh] w-full max-w-3xl overflow-hidden rounded-xl border border-slate-800 bg-slate-900 shadow-2xl"
-            onClick={(event) => event.stopPropagation()}
-          >
-            <div className="flex items-center justify-between border-b border-slate-800 p-4">
-              <div>
-                <p className="text-lg font-semibold text-slate-100">{getGroupTitle(episodesForSelectedSid)}</p>
-                <p className="text-sm text-slate-500">SID {selectedSid}</p>
-              </div>
-              <div className="flex items-center gap-2">
-                <Button
-                  size="sm"
-                  className={
-                    selectedSidFollowed
-                      ? "border border-sky-600/60 bg-sky-600/80 text-sky-50 hover:bg-rose-600/80 hover:border-rose-600/60 hover:text-rose-50"
-                      : "border-slate-700 bg-slate-800 text-slate-200 hover:bg-slate-700"
-                  }
-                  onClick={() => {
-                    if (!selectedSid) return;
-                    void toggleFollowSid(selectedSid, !selectedSidFollowed);
-                  }}
-                >
-                  {selectedSidFollowed ? (
-                    <><Check className="mr-2 h-4 w-4" />Following</>
-                  ) : (
-                    <><Plus className="mr-2 h-4 w-4" />Follow</>
-                  )}
-                </Button>
-                <Button
-                  variant="outline"
-                  size="sm"
-                  className="border-slate-700 bg-slate-800 text-slate-200 hover:bg-slate-700"
-                  onClick={() => setSelectedSid(null)}
-                >
-                  Close
-                </Button>
-              </div>
-            </div>
-            <div className="max-h-[65vh] overflow-y-auto p-4">
-              {episodesForSelectedSid.length === 0 ? (
-                <p className="text-sm text-slate-500">No episodes found for this series.</p>
-              ) : (
-                <div className="space-y-3">
-                  {selectedSidDescription ? (
-                    <section className="rounded-md border border-slate-800 bg-slate-900/70 p-3">
-                      <p className="mb-1 text-xs font-semibold uppercase tracking-wide text-slate-400">Description</p>
-                      <p className="text-sm leading-relaxed text-slate-300">{selectedSidDescription}</p>
-                    </section>
-                  ) : null}
-                  <ul className="space-y-2">
-                    {episodesForSelectedSid.map((episode) => (
-                      <li
-                        key={episode.pid}
-                        className="flex items-center justify-between gap-3 rounded-md border border-slate-800 bg-slate-900/70 p-3"
-                      >
-                        <div className="min-w-0 flex-1">
-                          <p className="truncate font-medium text-slate-100">{episode.title}</p>
-                          <p className="text-sm text-slate-500">
-                            PID {episode.pid} - {formatDate(episode.publishedAt)}
-                          </p>
-                          {getEpisodeDescription(episode) ? (
-                            <p className="mt-1 line-clamp-3 text-sm text-slate-300">{getEpisodeDescription(episode)}</p>
-                          ) : null}
-                        </div>
-                        <div className="flex items-center gap-2">
-                          <Button
-                            variant="secondary"
-                            size="sm"
-                            onClick={() => void handleDownload(episode, "web")}
-                            disabled={isDownloading !== null}
-                            className="relative h-8 overflow-hidden border border-sky-600/60 bg-sky-600/90 text-sky-50 hover:bg-sky-500"
-                          >
-                            <span
-                              className="absolute bottom-0 left-0 h-1 bg-sky-200/50 transition-[width] duration-200"
-                              style={{ width: `${downloadProgress[episode.pid] ?? 0}%` }}
-                            />
-                            <Download className="mr-2 h-4 w-4" />
-                            {isDownloading === episode.pid ? "Downloading..." : "Download"}
-                          </Button>
-                          <Button
-                            variant="outline"
-                            size="sm"
-                            onClick={() => void handleDownload(episode, "library")}
-                            disabled={isDownloading !== null}
-                            className="relative h-7 border-slate-700 bg-slate-800 px-2 text-xs text-slate-200 hover:bg-slate-700"
-                          >
-                            <span
-                              className="absolute bottom-0 left-0 h-1 bg-sky-500/60 transition-[width] duration-200"
-                              style={{ width: `${downloadProgress[episode.pid] ?? 0}%` }}
-                            />
-                            {isDownloading === episode.pid ? "..." : "Library"}
-                          </Button>
-                        </div>
-                      </li>
-                    ))}
-                  </ul>
-                </div>
-              )}
-            </div>
-          </div>
-        </div>
-      ) : null}
     </div>
   );
 }
