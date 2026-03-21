@@ -486,12 +486,18 @@ def _search_schedule(
         resolved_poster_url = runtime.get_poster_api_path(
             item.get("portrait_image") or item.get("series_image") or item.get("episode_image")
         )
+        series_description = item.get("series_sdesc") or item.get("series_desc")
+        episode_description = item.get("desc")
         results.append(
             {
                 "pid": str(item.get("pid", "")),
                 "sid": str(item.get("sid", "")),
                 "title": show_title,
                 "seriesTitle": series_title,
+                # Purpose: expose long-form metadata so clients can render richer show/movie context.
+                "description": episode_description or series_description,
+                "episodeDescription": episode_description,
+                "seriesDescription": series_description,
                 "publishedAt": item.get("showtime"),
                 "webUrl": web_url,
                 # Purpose: route poster images through short-lived local cache for faster UI loads.

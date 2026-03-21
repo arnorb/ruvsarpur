@@ -9,6 +9,9 @@ type ShowItem = {
   sid: string;
   title: string;
   seriesTitle: string;
+  description?: string | null;
+  episodeDescription?: string | null;
+  seriesDescription?: string | null;
   publishedAt: string;
   webUrl?: string;
   posterUrl?: string | null;
@@ -136,6 +139,21 @@ function isSidFollowed(sidShows: ShowItem[]): boolean {
   return sidShows.some((show) => show.isFollowed);
 }
 
+function getGroupDescription(sidShows: ShowItem[]): string | null {
+  const candidates = sidShows
+    .flatMap((show) => [show.seriesDescription, show.description, show.episodeDescription])
+    .map((value) => (value ?? "").trim())
+    .filter((value) => value.length > 0);
+  if (candidates.length === 0) return null;
+  return candidates.sort((a, b) => b.length - a.length)[0];
+}
+
+function getEpisodeDescription(show: ShowItem): string | null {
+  const description = show.episodeDescription ?? show.description ?? show.seriesDescription;
+  const normalized = (description ?? "").trim();
+  return normalized.length > 0 ? normalized : null;
+}
+
 export default function App() {
   const [query, setQuery] = useState("");
   const [shows, setShows] = useState<ShowItem[]>([]);
@@ -233,6 +251,10 @@ export default function App() {
     if (!selectedSid) return false;
     return shows.some((show) => show.sid === selectedSid && show.isFollowed);
   }, [selectedSid, shows]);
+  const selectedSidDescription = useMemo(
+    () => getGroupDescription(episodesForSelectedSid),
+    [episodesForSelectedSid],
+  );
   const followedCount = useMemo(() => shows.filter((show) => show.isFollowed).length, [shows]);
 
   const startRefreshTicker = () => {
@@ -1007,50 +1029,61 @@ export default function App() {
               {episodesForSelectedSid.length === 0 ? (
                 <p className="text-sm text-slate-500">No episodes found for this series.</p>
               ) : (
-                <ul className="space-y-2">
-                  {episodesForSelectedSid.map((episode) => (
-                    <li
-                      key={episode.pid}
-                      className="flex items-center justify-between gap-3 rounded-md border border-slate-800 bg-slate-900/70 p-3"
-                    >
-                      <div className="min-w-0">
-                        <p className="truncate font-medium text-slate-100">{episode.title}</p>
-                        <p className="text-sm text-slate-500">
-                          PID {episode.pid} - {formatDate(episode.publishedAt)}
-                        </p>
-                      </div>
-                      <div className="flex items-center gap-2">
-                        <Button
-                          variant="secondary"
-                          size="sm"
-                          onClick={() => void handleDownload(episode, "web")}
-                          disabled={isDownloading !== null}
-                          className="relative h-8 overflow-hidden border border-sky-600/60 bg-sky-600/90 text-sky-50 hover:bg-sky-500"
-                        >
-                          <span
-                            className="absolute bottom-0 left-0 h-1 bg-sky-200/50 transition-[width] duration-200"
-                            style={{ width: `${downloadProgress[episode.pid] ?? 0}%` }}
-                          />
-                          <Download className="mr-2 h-4 w-4" />
-                          {isDownloading === episode.pid ? "Downloading..." : "Download"}
-                        </Button>
-                        <Button
-                          variant="outline"
-                          size="sm"
-                          onClick={() => void handleDownload(episode, "library")}
-                          disabled={isDownloading !== null}
-                          className="relative h-7 border-slate-700 bg-slate-800 px-2 text-xs text-slate-200 hover:bg-slate-700"
-                        >
-                          <span
-                            className="absolute bottom-0 left-0 h-1 bg-sky-500/60 transition-[width] duration-200"
-                            style={{ width: `${downloadProgress[episode.pid] ?? 0}%` }}
-                          />
-                          {isDownloading === episode.pid ? "..." : "Library"}
-                        </Button>
-                      </div>
-                    </li>
-                  ))}
-                </ul>
+                <div className="space-y-3">
+                  {selectedSidDescription ? (
+                    <section className="rounded-md border border-slate-800 bg-slate-900/70 p-3">
+                      <p className="mb-1 text-xs font-semibold uppercase tracking-wide text-slate-400">Description</p>
+                      <p className="text-sm leading-relaxed text-slate-300">{selectedSidDescription}</p>
+                    </section>
+                  ) : null}
+                  <ul className="space-y-2">
+                    {episodesForSelectedSid.map((episode) => (
+                      <li
+                        key={episode.pid}
+                        className="flex items-center justify-between gap-3 rounded-md border border-slate-800 bg-slate-900/70 p-3"
+                      >
+                        <div className="min-w-0 flex-1">
+                          <p className="truncate font-medium text-slate-100">{episode.title}</p>
+                          <p className="text-sm text-slate-500">
+                            PID {episode.pid} - {formatDate(episode.publishedAt)}
+                          </p>
+                          {getEpisodeDescription(episode) ? (
+                            <p className="mt-1 line-clamp-3 text-sm text-slate-300">{getEpisodeDescription(episode)}</p>
+                          ) : null}
+                        </div>
+                        <div className="flex items-center gap-2">
+                          <Button
+                            variant="secondary"
+                            size="sm"
+                            onClick={() => void handleDownload(episode, "web")}
+                            disabled={isDownloading !== null}
+                            className="relative h-8 overflow-hidden border border-sky-600/60 bg-sky-600/90 text-sky-50 hover:bg-sky-500"
+                          >
+                            <span
+                              className="absolute bottom-0 left-0 h-1 bg-sky-200/50 transition-[width] duration-200"
+                              style={{ width: `${downloadProgress[episode.pid] ?? 0}%` }}
+                            />
+                            <Download className="mr-2 h-4 w-4" />
+                            {isDownloading === episode.pid ? "Downloading..." : "Download"}
+                          </Button>
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            onClick={() => void handleDownload(episode, "library")}
+                            disabled={isDownloading !== null}
+                            className="relative h-7 border-slate-700 bg-slate-800 px-2 text-xs text-slate-200 hover:bg-slate-700"
+                          >
+                            <span
+                              className="absolute bottom-0 left-0 h-1 bg-sky-500/60 transition-[width] duration-200"
+                              style={{ width: `${downloadProgress[episode.pid] ?? 0}%` }}
+                            />
+                            {isDownloading === episode.pid ? "..." : "Library"}
+                          </Button>
+                        </div>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
               )}
             </div>
           </div>
