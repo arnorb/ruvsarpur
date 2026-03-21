@@ -1,8 +1,7 @@
 // frontend/src/App.tsx
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Download, RefreshCw, Search } from "lucide-react";
+import { Check, Clapperboard, Download, Film, Plus, RefreshCw, Search, Settings, Tv, Volleyball } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 
 type ShowItem = {
@@ -11,8 +10,10 @@ type ShowItem = {
   title: string;
   seriesTitle: string;
   publishedAt: string;
+  webUrl?: string;
   posterUrl?: string | null;
   isFollowed?: boolean;
+  contentType?: "movie_or_docu" | "sport" | "show";
 };
 
 type AutoSettings = {
@@ -36,6 +37,16 @@ type AutoStatus = {
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? "http://127.0.0.1:8000";
 const PAGE_SIZE = 100;
 const TRAILING_PARENTHESIS_REGEX = /\s*\([^)]*\)\s*$/;
+const CONTENT_GROUP_ORDER: Array<"movie_or_docu" | "sport" | "show"> = [
+  "movie_or_docu",
+  "sport",
+  "show",
+];
+const CONTENT_GROUP_LABEL: Record<"movie_or_docu" | "sport" | "show", string> = {
+  movie_or_docu: "Movies & Docs",
+  sport: "Sports",
+  show: "Shows",
+};
 
 function formatDate(isoDate: string): string {
   if (!isoDate) return "Unknown date";
@@ -77,6 +88,10 @@ function getGroupPosterUrl(sidShows: ShowItem[]): string | null {
   return sidShows.find((show) => !!show.posterUrl)?.posterUrl ?? null;
 }
 
+function getGroupContentType(sidShows: ShowItem[]): "movie_or_docu" | "sport" | "show" {
+  return sidShows[0]?.contentType ?? "show";
+}
+
 function isSidFollowed(sidShows: ShowItem[]): boolean {
   return sidShows.some((show) => show.isFollowed);
 }
@@ -89,8 +104,10 @@ export default function App() {
   const [refreshProgress, setRefreshProgress] = useState(0);
   const [downloadProgress, setDownloadProgress] = useState<Record<string, number>>({});
   const [currentPage, setCurrentPage] = useState(1);
-  const [viewMode, setViewMode] = useState<"list" | "poster">("list");
+  const [viewMode, setViewMode] = useState<"list" | "poster">("poster");
+  const [contentFilter, setContentFilter] = useState<"movie_or_docu" | "sport" | "show">("show");
   const [selectedSid, setSelectedSid] = useState<string | null>(null);
+  const [showAutomationSettings, setShowAutomationSettings] = useState(false);
   const [imageLoadFailed, setImageLoadFailed] = useState<Record<string, boolean>>({});
   const [settings, setSettings] = useState<AutoSettings>({
     watchlistSids: [],
@@ -115,25 +132,53 @@ export default function App() {
   const downloadTickerRef = useRef<Record<string, number>>({});
 
   const hasQuery = useMemo(() => query.trim().length > 0, [query]);
-  const totalPages = useMemo(() => Math.max(1, Math.ceil(shows.length / PAGE_SIZE)), [shows.length]);
-  const paginatedShows = useMemo(() => {
-    const start = (currentPage - 1) * PAGE_SIZE;
-    const end = start + PAGE_SIZE;
-    return shows.slice(start, end);
-  }, [shows, currentPage]);
-  const pageStartIndex = useMemo(() => (shows.length === 0 ? 0 : (currentPage - 1) * PAGE_SIZE + 1), [shows.length, currentPage]);
-  const pageEndIndex = useMemo(
-    () => Math.min(currentPage * PAGE_SIZE, shows.length),
-    [currentPage, shows.length],
-  );
-  const groupedPageShows = useMemo(() => {
+  const groupedAllShows = useMemo(() => {
     const grouped: Record<string, ShowItem[]> = {};
-    for (const show of paginatedShows) {
+    for (const show of shows) {
       if (!grouped[show.sid]) grouped[show.sid] = [];
       grouped[show.sid].push(show);
     }
-    return Object.entries(grouped);
-  }, [paginatedShows]);
+    const groupedEntries = Object.entries(grouped).map(([sid, sidShows]) => {
+      const sortedEpisodes = [...sidShows].sort(
+        (a, b) => new Date(b.publishedAt).getTime() - new Date(a.publishedAt).getTime(),
+      );
+      return [sid, sortedEpisodes] as [string, ShowItem[]];
+    });
+    // Sort series by newest episode first.
+    groupedEntries.sort((a, b) => {
+      const aType = getGroupContentType(a[1]);
+      const bType = getGroupContentType(b[1]);
+      const typeOrderDelta = CONTENT_GROUP_ORDER.indexOf(aType) - CONTENT_GROUP_ORDER.indexOf(bType);
+      if (typeOrderDelta !== 0) return typeOrderDelta;
+      return new Date(b[1][0]?.publishedAt ?? 0).getTime() - new Date(a[1][0]?.publishedAt ?? 0).getTime();
+    });
+    return groupedEntries;
+  }, [shows]);
+
+  const filteredGroupedAllShows = useMemo(
+    () => groupedAllShows.filter((group) => getGroupContentType(group[1]) === contentFilter),
+    [groupedAllShows, contentFilter],
+  );
+  const filteredGroupedPageShows = useMemo(() => {
+    const start = (currentPage - 1) * PAGE_SIZE;
+    const end = start + PAGE_SIZE;
+    return filteredGroupedAllShows.slice(start, end);
+  }, [filteredGroupedAllShows, currentPage]);
+  const categorizedPageShows = useMemo(() => {
+    const categorized: Record<"movie_or_docu" | "sport" | "show", Array<[string, ShowItem[]]>> = {
+      movie_or_docu: [],
+      sport: [],
+      show: [],
+    };
+    for (const group of filteredGroupedPageShows) {
+      categorized[getGroupContentType(group[1])].push(group);
+    }
+    return categorized;
+  }, [filteredGroupedPageShows]);
+  const totalItemsForView = filteredGroupedAllShows.length;
+  const totalPages = Math.max(1, Math.ceil(totalItemsForView / PAGE_SIZE));
+  const pageStartIndex = totalItemsForView === 0 ? 0 : (currentPage - 1) * PAGE_SIZE + 1;
+  const pageEndIndex = Math.min(currentPage * PAGE_SIZE, totalItemsForView);
   const episodesForSelectedSid = useMemo(() => {
     if (!selectedSid) return [];
     return shows
@@ -144,6 +189,7 @@ export default function App() {
     if (!selectedSid) return false;
     return shows.some((show) => show.sid === selectedSid && show.isFollowed);
   }, [selectedSid, shows]);
+  const followedCount = useMemo(() => shows.filter((show) => show.isFollowed).length, [shows]);
 
   const startRefreshTicker = () => {
     if (refreshTickerRef.current !== null) window.clearInterval(refreshTickerRef.current);
@@ -280,6 +326,11 @@ export default function App() {
     setShows((current) => current.map((show) => (show.sid === sid ? { ...show, isFollowed: followed } : show)));
   };
 
+  const changePage = (nextPage: number) => {
+    setCurrentPage(nextPage);
+    window.scrollTo({ top: 0, behavior: "smooth" });
+  };
+
   const toggleFollowSid = async (sid: string, follow: boolean) => {
     setErrorMessage("");
     try {
@@ -307,22 +358,38 @@ export default function App() {
     }
   };
 
-  const handleDownload = async (show: ShowItem) => {
+  const handleDownload = async (show: ShowItem, mode: "web" | "library") => {
     setErrorMessage("");
     setIsDownloading(show.pid);
-    setStatusMessage(`Downloading ${show.title}...`);
+    setStatusMessage(`${mode === "web" ? "Web" : "Library"} downloading ${show.title}...`);
     startDownloadTicker(show.pid);
     try {
       const response = await fetch(`${API_BASE_URL}/api/download`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ pid: show.pid }),
+        body: JSON.stringify({ pid: show.pid, mode }),
       });
-      const data = (await response.json()) as { message?: string; error?: string };
+      const data = (await response.json()) as {
+        message?: string;
+        error?: string;
+        outputDir?: string;
+        downloadUrl?: string;
+        fileName?: string;
+      };
       if (!response.ok) {
         throw new Error(data.error ?? "Download failed");
       }
-      setStatusMessage(data.message ?? `Downloaded ${show.title}`);
+      const suffix = data.outputDir ? ` (${data.outputDir})` : "";
+      setStatusMessage((data.message ?? `Downloaded ${show.title}`) + suffix);
+      if (mode === "web" && data.downloadUrl) {
+        const href = data.downloadUrl.startsWith("http") ? data.downloadUrl : `${API_BASE_URL}${data.downloadUrl}`;
+        const downloadAnchor = document.createElement("a");
+        downloadAnchor.href = href;
+        if (data.fileName) downloadAnchor.download = data.fileName;
+        document.body.appendChild(downloadAnchor);
+        downloadAnchor.click();
+        document.body.removeChild(downloadAnchor);
+      }
     } catch (error) {
       const message = error instanceof Error ? error.message : "Unexpected error while downloading";
       setErrorMessage(message);
@@ -331,6 +398,11 @@ export default function App() {
       stopDownloadTicker(show.pid);
       setIsDownloading(null);
     }
+  };
+
+  const handleWebOpen = (show: ShowItem) => {
+    const targetUrl = show.webUrl && show.webUrl.length > 0 ? show.webUrl : "https://www.ruv.is/sjonvarp";
+    window.open(targetUrl, "_blank", "noopener,noreferrer");
   };
 
   useEffect(() => {
@@ -346,6 +418,16 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    setCurrentPage(1);
+  }, [contentFilter]);
+
+  useEffect(() => {
+    if (currentPage > totalPages) {
+      setCurrentPage(totalPages);
+    }
+  }, [currentPage, totalPages]);
+
+  useEffect(() => {
     return () => {
       if (refreshTickerRef.current !== null) window.clearInterval(refreshTickerRef.current);
       for (const pid in downloadTickerRef.current) {
@@ -354,258 +436,339 @@ export default function App() {
     };
   }, []);
 
+  const sidebarNav = [
+    { key: "show" as const, label: "Shows", icon: <Tv className="h-5 w-5" /> },
+    { key: "movie_or_docu" as const, label: "Movies", icon: <Film className="h-5 w-5" /> },
+    { key: "sport" as const, label: "Sports", icon: <Volleyball className="h-5 w-5" /> },
+  ];
+
   return (
-    <main className="mx-auto min-h-screen w-full max-w-4xl px-4 py-10">
-      <Card>
-        <CardHeader>
-          <CardTitle>RUV Sarpur GUI</CardTitle>
-          <CardDescription>Refresh, search, and download directly through the Python backend API.</CardDescription>
-        </CardHeader>
-        <CardContent className="space-y-4">
-          <div className="flex flex-col gap-3 md:flex-row">
-            <Button
-              onClick={() => void loadShows(true)}
-              disabled={isLoading}
-              className="relative overflow-hidden md:w-40"
+    <div className="flex min-h-screen bg-slate-950 text-slate-100">
+
+      {/* Left sidebar */}
+      <aside className="sticky top-0 flex h-screen w-44 shrink-0 flex-col border-r border-slate-800 bg-slate-900/80 py-4 px-3">
+        {/* Logo */}
+        <div className="mb-6 flex items-center gap-2">
+          <Clapperboard className="h-6 w-6 shrink-0 text-sky-400" />
+          <span className="text-base font-bold tracking-tight text-slate-100">RÚV Sarpur</span>
+        </div>
+
+        {/* Nav items */}
+        <nav className="flex w-full flex-1 flex-col gap-1">
+          {sidebarNav.map(({ key, label, icon }) => (
+            <button
+              key={key}
+              onClick={() => setContentFilter(key)}
+              className={`flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-sm font-medium transition-colors ${
+                contentFilter === key
+                  ? "bg-sky-600/20 text-sky-300"
+                  : "text-slate-400 hover:bg-slate-800 hover:text-slate-100"
+              }`}
             >
-              <span
-                className="absolute bottom-0 left-0 h-1 bg-slate-100/40 transition-[width] duration-200"
-                style={{ width: `${refreshProgress}%` }}
-              />
-              <RefreshCw className={`mr-2 h-4 w-4 ${isLoading ? "animate-spin" : ""}`} />
-              {isLoading ? `Refreshing ${Math.round(refreshProgress)}%` : "Refresh list"}
-            </Button>
+              <span className="shrink-0">{icon}</span>
+              <span>{label}</span>
+            </button>
+          ))}
+        </nav>
 
-            <div className="relative flex-1">
-              <Search className="pointer-events-none absolute left-3 top-3 h-4 w-4 text-slate-500" />
-              <Input
-                value={query}
-                onChange={(event) => setQuery(event.target.value)}
-                placeholder="Search by title or ID"
-                className="pl-9"
-                onKeyDown={(event) => {
-                  if (event.key === "Enter") void loadShows(false);
-                }}
-              />
-            </div>
+        {/* Settings at bottom */}
+        <button
+          onClick={() => setShowAutomationSettings(true)}
+          className="flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-sm font-medium text-slate-400 transition-colors hover:bg-slate-800 hover:text-slate-100"
+        >
+          <Settings className="h-5 w-5 shrink-0" />
+          <span>Settings</span>
+        </button>
+      </aside>
 
-            <Button onClick={() => void loadShows(false)} variant="outline" disabled={isLoading}>
+      {/* Main content */}
+      <main className="flex min-w-0 flex-1 flex-col">
+
+        {/* Top bar */}
+        <header className="flex items-center gap-3 border-b border-slate-800 bg-slate-900/60 px-4 py-3">
+          {/* Search */}
+          <div className="flex h-9 flex-1 items-center overflow-hidden rounded-md border border-slate-700 bg-slate-800">
+            <Search className="ml-3 h-4 w-4 shrink-0 text-slate-500" />
+            <Input
+              value={query}
+              onChange={(event) => setQuery(event.target.value)}
+              placeholder="Search by title, SID, or PID"
+              className="h-9 border-0 bg-transparent text-slate-100 placeholder:text-slate-500 focus-visible:ring-0 focus-visible:ring-offset-0"
+              onKeyDown={(event) => {
+                if (event.key === "Enter") void loadShows(false);
+              }}
+            />
+            <Button
+              onClick={() => void loadShows(false)}
+              variant="outline"
+              disabled={isLoading}
+              size="sm"
+              className="mr-1 h-7 border-slate-700 bg-slate-700 px-3 text-xs text-slate-100 hover:bg-slate-600"
+            >
               Search
             </Button>
-
-            <div className="flex items-center gap-2">
-              <Button
-                onClick={() => setViewMode("list")}
-                variant={viewMode === "list" ? "default" : "outline"}
-                disabled={isLoading}
-              >
-                List view
-              </Button>
-              <Button
-                onClick={() => setViewMode("poster")}
-                variant={viewMode === "poster" ? "default" : "outline"}
-                disabled={isLoading}
-              >
-                Poster view
-              </Button>
-            </div>
           </div>
 
-          {statusMessage ? <p className="text-sm text-slate-600">{statusMessage}</p> : null}
-          {errorMessage ? <p className="text-sm text-red-600">{errorMessage}</p> : null}
-
-          <div className="rounded-md border border-slate-200 p-3">
-            <div className="mb-2 flex flex-wrap items-center gap-2">
-              <Button
-                variant={settings.autoEnabled ? "default" : "outline"}
-                size="sm"
-                onClick={() => setSettings((current) => ({ ...current, autoEnabled: !current.autoEnabled }))}
-              >
-                {settings.autoEnabled ? "Auto enabled" : "Auto disabled"}
-              </Button>
-              <Button size="sm" variant="outline" onClick={() => void runAutoNow()} disabled={autoStatus.isRunning}>
-                {autoStatus.isRunning ? "Auto running..." : "Run auto now"}
-              </Button>
-              <span className="text-xs text-slate-500">
-                Last run: {autoStatus.lastRunAt ? formatDate(autoStatus.lastRunAt) : "never"}
-              </span>
-              {autoStatus.lastRunMessage ? (
-                <span className="text-xs text-slate-500">{autoStatus.lastRunMessage}</span>
-              ) : null}
-            </div>
-            <div className="grid grid-cols-1 gap-2 md:grid-cols-2">
-              <Input
-                value={settings.outputDir}
-                onChange={(event) => setSettings((current) => ({ ...current, outputDir: event.target.value }))}
-                placeholder="Output folder for downloads"
-              />
-              <Input
-                type="number"
-                value={String(settings.autoIntervalMinutes)}
-                onChange={(event) =>
-                  setSettings((current) => ({
-                    ...current,
-                    autoIntervalMinutes: Math.max(5, Number(event.target.value) || 60),
-                  }))
-                }
-                placeholder="Auto interval (minutes)"
-              />
-              <Input
-                value={settings.plexBaseUrl}
-                onChange={(event) => setSettings((current) => ({ ...current, plexBaseUrl: event.target.value }))}
-                placeholder="Plex base URL, e.g. http://truenas:32400"
-              />
-              <Input
-                value={settings.plexLibrarySectionId}
-                onChange={(event) =>
-                  setSettings((current) => ({ ...current, plexLibrarySectionId: event.target.value }))
-                }
-                placeholder="Plex library section id"
-              />
-              <Input
-                value={settings.plexToken}
-                onChange={(event) => setSettings((current) => ({ ...current, plexToken: event.target.value }))}
-                placeholder="Plex token"
-              />
-              <Input
-                value={settings.plexLibraryPath}
-                onChange={(event) => setSettings((current) => ({ ...current, plexLibraryPath: event.target.value }))}
-                placeholder="Optional Plex path filter"
-              />
-            </div>
-            <div className="mt-2">
-              <Button size="sm" onClick={() => void saveSettings()} disabled={isSavingSettings}>
-                {isSavingSettings ? "Saving..." : "Save automation settings"}
-              </Button>
-            </div>
+          {/* View toggle */}
+          <div className="flex shrink-0 items-center gap-1">
+            <Button
+              onClick={() => setViewMode("list")}
+              size="sm"
+              className={
+                viewMode === "list"
+                  ? "h-9 border border-slate-600 bg-slate-100 text-slate-900 hover:bg-white"
+                  : "h-9 border-slate-700 bg-slate-800 text-slate-200 hover:bg-slate-700"
+              }
+              disabled={isLoading}
+            >
+              <Tv className="mr-2 h-4 w-4" />
+              List
+            </Button>
+            <Button
+              onClick={() => setViewMode("poster")}
+              size="sm"
+              className={
+                viewMode === "poster"
+                  ? "h-9 border border-slate-600 bg-slate-100 text-slate-900 hover:bg-white"
+                  : "h-9 border-slate-700 bg-slate-800 text-slate-200 hover:bg-slate-700"
+              }
+              disabled={isLoading}
+            >
+              <Clapperboard className="mr-2 h-4 w-4" />
+              Posters
+            </Button>
           </div>
 
-          <div className="rounded-md border border-slate-200">
+          {/* Status pills */}
+          <div className="hidden items-center gap-2 text-xs lg:flex">
+            <span className="rounded-full border border-slate-700 bg-slate-800 px-3 py-1 text-slate-300">
+              {shows.length} episodes
+            </span>
+            <span className="rounded-full border border-slate-700 bg-slate-800 px-3 py-1 text-slate-300">
+              {followedCount} followed
+            </span>
+            <span
+              className={`rounded-full border px-3 py-1 ${
+                autoStatus.isRunning
+                  ? "border-emerald-500/60 bg-emerald-500/20 text-emerald-300"
+                  : "border-slate-700 bg-slate-800 text-slate-300"
+              }`}
+            >
+              {autoStatus.isRunning ? "auto running" : "auto idle"}
+            </span>
+          </div>
+
+          {/* Refresh */}
+          <Button
+            onClick={() => void loadShows(true)}
+            disabled={isLoading}
+            size="sm"
+            className="relative h-9 shrink-0 overflow-hidden border border-sky-600/60 bg-sky-600/90 text-sky-50 hover:bg-sky-500"
+          >
+            <span
+              className="absolute bottom-0 left-0 h-1 bg-sky-200/40 transition-[width] duration-200"
+              style={{ width: `${refreshProgress}%` }}
+            />
+            <RefreshCw className={`mr-2 h-4 w-4 ${isLoading ? "animate-spin" : ""}`} />
+            {isLoading ? `${Math.round(refreshProgress)}%` : "Refresh"}
+          </Button>
+        </header>
+
+        {/* Content area */}
+        <div className="flex-1 overflow-auto p-4 md:p-6">
+          {statusMessage ? (
+            <p className="mb-4 rounded-md border border-emerald-500/30 bg-emerald-500/10 px-3 py-2 text-sm text-emerald-300">
+              {statusMessage}
+            </p>
+          ) : null}
+          {errorMessage ? (
+            <p className="mb-4 rounded-md border border-red-500/30 bg-red-500/10 px-3 py-2 text-sm text-red-300">
+              {errorMessage}
+            </p>
+          ) : null}
+
+          <div className={viewMode === "poster" ? "" : "rounded-lg border border-slate-800 bg-slate-900/60"}>
             {shows.length === 0 ? (
-              <p className="p-4 text-sm text-slate-500">
+              <p className="p-4 text-sm text-slate-400">
                 {hasQuery ? "No results for your search." : "No shows returned from backend."}
               </p>
             ) : viewMode === "list" ? (
-              <div className="divide-y divide-slate-200">
-                {groupedPageShows.map(([sid, sidShows]) => (
-                  <section key={sid} className="p-4">
-                    <div className="mb-3 flex items-center justify-between gap-3">
-                      <div>
-                        <p className="text-sm font-semibold text-slate-800">
-                          SID {sid} - {getGroupTitle(sidShows)}
-                        </p>
-                        <p className="text-xs text-slate-500">{sidShows.length} show(s) on this page</p>
-                      </div>
-                      <Button
-                        size="sm"
-                        variant={isSidFollowed(sidShows) ? "default" : "outline"}
-                        onClick={() => void toggleFollowSid(sid, !isSidFollowed(sidShows))}
-                      >
-                        {isSidFollowed(sidShows) ? "Following" : "Follow"}
-                      </Button>
-                    </div>
-
-                    <ul className="space-y-3">
-                      {sidShows.map((show) => (
-                        <li key={show.pid} className="flex items-center justify-between gap-3 rounded-md border border-slate-200 p-3">
-                          <div className="flex min-w-0 flex-1 items-center gap-3">
-                            <div className="min-w-0">
-                              <p className="truncate font-medium text-slate-900">{show.title}</p>
-                              <p className="text-sm text-slate-500">
-                                PID {show.pid} - {formatDate(show.publishedAt)}
-                              </p>
+              <div className="divide-y divide-slate-800">
+                {CONTENT_GROUP_ORDER.map((groupType) =>
+                  groupType === contentFilter && categorizedPageShows[groupType].length > 0 ? (
+                    <section key={groupType} className="p-4">
+                      <div className="space-y-4">
+                        {categorizedPageShows[groupType].map(([sid, sidShows]) => (
+                          <section key={sid}>
+                            <div className="mb-3 flex items-center justify-between gap-3">
+                              <div>
+                                <p className="text-sm font-semibold text-slate-100">
+                                  {getGroupTitle(sidShows)}
+                                </p>
+                                <p className="text-xs text-slate-500">{sidShows.length} episode(s)</p>
+                              </div>
+                              <Button
+                                size="sm"
+                                className={
+                                  isSidFollowed(sidShows)
+                                    ? "border border-sky-600/60 bg-sky-600/80 text-sky-50 hover:bg-rose-600/80 hover:border-rose-600/60 hover:text-rose-50"
+                                    : "border-slate-700 bg-slate-800 text-slate-200 hover:bg-slate-700"
+                                }
+                                onClick={() => void toggleFollowSid(sid, !isSidFollowed(sidShows))}
+                              >
+                                {isSidFollowed(sidShows) ? (
+                                  <><Check className="mr-2 h-4 w-4" />Following</>
+                                ) : (
+                                  <><Plus className="mr-2 h-4 w-4" />Follow</>
+                                )}
+                              </Button>
                             </div>
-                          </div>
 
-                          <Button
-                            variant="secondary"
-                            size="sm"
-                            onClick={() => void handleDownload(show)}
-                            disabled={isDownloading !== null}
-                            className="relative overflow-hidden"
-                          >
-                            <span
-                              className="absolute bottom-0 left-0 h-1 bg-slate-300 transition-[width] duration-200"
-                              style={{ width: `${downloadProgress[show.pid] ?? 0}%` }}
-                            />
-                            <Download className="mr-2 h-4 w-4" />
-                            {isDownloading === show.pid
-                              ? `Downloading ${Math.round(downloadProgress[show.pid] ?? 0)}%`
-                              : "Download"}
-                          </Button>
-                        </li>
-                      ))}
-                    </ul>
-                  </section>
-                ))}
+                            <ul className="space-y-2">
+                              {sidShows.map((show) => (
+                                <li
+                                  key={show.pid}
+                                  className="flex items-center justify-between gap-3 rounded-md border border-slate-800 bg-slate-900/70 p-3"
+                                >
+                                  <div className="min-w-0 flex-1">
+                                    <p className="truncate font-medium text-slate-100">{show.title}</p>
+                                    <p className="text-xs text-slate-500">
+                                      PID {show.pid} - {formatDate(show.publishedAt)}
+                                    </p>
+                                  </div>
+
+                                  <div className="flex items-center gap-2">
+                                    <Button
+                                      variant="secondary"
+                                      size="sm"
+                                      onClick={() => void handleDownload(show, "web")}
+                                      disabled={isDownloading !== null}
+                                      className="relative h-8 overflow-hidden border border-sky-600/60 bg-sky-600/90 text-sky-50 hover:bg-sky-500"
+                                    >
+                                      <span
+                                        className="absolute bottom-0 left-0 h-1 bg-sky-200/50 transition-[width] duration-200"
+                                        style={{ width: `${downloadProgress[show.pid] ?? 0}%` }}
+                                      />
+                                      <Download className="mr-2 h-4 w-4" />
+                                      {isDownloading === show.pid ? "Downloading..." : "Download"}
+                                    </Button>
+                                    <Button
+                                      variant="outline"
+                                      size="sm"
+                                      onClick={() => void handleDownload(show, "library")}
+                                      disabled={isDownloading !== null}
+                                      className="relative h-7 border-slate-700 bg-slate-800 px-2 text-xs text-slate-200 hover:bg-slate-700"
+                                    >
+                                      <span
+                                        className="absolute bottom-0 left-0 h-1 bg-sky-500/60 transition-[width] duration-200"
+                                        style={{ width: `${downloadProgress[show.pid] ?? 0}%` }}
+                                      />
+                                      {isDownloading === show.pid ? "..." : "Library"}
+                                    </Button>
+                                  </div>
+                                </li>
+                              ))}
+                            </ul>
+                          </section>
+                        ))}
+                      </div>
+                    </section>
+                  ) : null,
+                )}
               </div>
             ) : (
-              <div className="p-4">
-                <ul className="grid grid-cols-2 gap-4 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5">
-                {groupedPageShows.map(([sid, sidShows]) => (
-                    <li
-                      key={sid}
-                      className="cursor-pointer rounded-md border border-slate-200 p-3 transition-colors hover:bg-slate-50"
-                      onClick={() => setSelectedSid(sid)}
-                    >
-                      <div className="mx-auto mb-3 h-[210px] w-[140px] overflow-hidden rounded border border-slate-200 bg-slate-100">
-                        {getGroupPosterUrl(sidShows) && !imageLoadFailed[sid] ? (
-                          <img
-                            src={getGroupPosterUrl(sidShows) ?? ""}
-                            alt={`${getGroupTitle(sidShows)} poster`}
-                            className="h-full w-full object-cover"
-                            loading="lazy"
-                            onError={() => setImageLoadFailed((current) => ({ ...current, [sid]: true }))}
-                          />
-                        ) : (
-                          <div className="flex h-full w-full items-center justify-center text-xs font-medium text-slate-500">
-                            Placeholder
-                          </div>
-                        )}
-                      </div>
-                      <p className="line-clamp-2 text-sm font-medium text-slate-900">{getGroupTitle(sidShows)}</p>
-                      <p className="text-xs text-slate-500">{sidShows.length} episode(s) on this page</p>
-                      <div className="mt-2">
-                        <Button
-                          size="sm"
-                          variant={isSidFollowed(sidShows) ? "default" : "outline"}
-                          className="w-full"
-                          onClick={(event) => {
-                            event.stopPropagation();
-                            void toggleFollowSid(sid, !isSidFollowed(sidShows));
-                          }}
-                        >
-                          {isSidFollowed(sidShows) ? "Following" : "Follow"}
-                        </Button>
-                      </div>
-                    </li>
-                  ))}
-                </ul>
+              <div>
+                <div className="space-y-6">
+                  {CONTENT_GROUP_ORDER.map((groupType) =>
+                    groupType === contentFilter && categorizedPageShows[groupType].length > 0 ? (
+                      <section key={groupType}>
+                        <ul className="grid grid-cols-2 gap-4 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5">
+                          {categorizedPageShows[groupType].map(([sid, sidShows]) => (
+                            <li
+                              key={sid}
+                              className="group cursor-pointer transition-transform hover:-translate-y-0.5"
+                              onClick={() => setSelectedSid(sid)}
+                            >
+                              <div className="relative aspect-2/3 overflow-hidden rounded-lg bg-slate-800">
+                                {getGroupPosterUrl(sidShows) && !imageLoadFailed[sid] ? (
+                                  <img
+                                    src={getGroupPosterUrl(sidShows) ?? ""}
+                                    alt={`${getGroupTitle(sidShows)} poster`}
+                                    className="h-full w-full object-cover transition-transform duration-300 group-hover:scale-105"
+                                    loading="lazy"
+                                    onError={() => setImageLoadFailed((current) => ({ ...current, [sid]: true }))}
+                                  />
+                                ) : (
+                                  <div className="flex h-full w-full items-center justify-center text-xs font-medium text-slate-500">
+                                    No image
+                                  </div>
+                                )}
+                                {/* Follow bar — shown on hover, or always visible when already followed */}
+                                <div
+                                  className={`absolute inset-x-0 bottom-0 flex items-center justify-center bg-gradient-to-t from-black/90 to-transparent px-2 pb-2 pt-6 transition-opacity duration-200 ${
+                                    isSidFollowed(sidShows) ? "opacity-100" : "opacity-0 group-hover:opacity-100"
+                                  }`}
+                                  onClick={(event) => event.stopPropagation()}
+                                >
+                                  <button
+                                    onClick={() => void toggleFollowSid(sid, !isSidFollowed(sidShows))}
+                                    className={`flex w-full items-center justify-center gap-1.5 rounded-md py-1.5 text-xs font-semibold transition-colors ${
+                                      isSidFollowed(sidShows)
+                                        ? "bg-sky-600/90 text-sky-50 hover:bg-rose-600/90 hover:text-rose-50"
+                                        : "bg-white/10 text-slate-100 backdrop-blur-sm hover:bg-white/20"
+                                    }`}
+                                  >
+                                    {isSidFollowed(sidShows) ? (
+                                      <>
+                                        <Check className="h-3.5 w-3.5" />
+                                        Following
+                                      </>
+                                    ) : (
+                                      <>
+                                        <Plus className="h-3.5 w-3.5" />
+                                        Follow
+                                      </>
+                                    )}
+                                  </button>
+                                </div>
+                              </div>
+                              <div className="pt-2">
+                                <p className="line-clamp-2 text-sm font-semibold text-slate-100">{getGroupTitle(sidShows)}</p>
+                              </div>
+                            </li>
+                          ))}
+                        </ul>
+                      </section>
+                    ) : null,
+                  )}
+                </div>
               </div>
             )}
           </div>
 
           {shows.length > 0 ? (
-            <div className="flex items-center justify-between gap-3">
-              <p className="text-sm text-slate-600">
-                Showing {pageStartIndex}-{pageEndIndex} of {shows.length}
+            <div className="mt-6 flex flex-wrap items-center justify-between gap-3">
+              <p className="text-sm text-slate-400">
+                Showing {pageStartIndex}–{pageEndIndex} of {totalItemsForView}
               </p>
               <div className="flex items-center gap-2">
                 <Button
                   variant="outline"
                   size="sm"
-                  onClick={() => setCurrentPage((page) => Math.max(1, page - 1))}
+                  className="border-slate-700 bg-slate-800 text-slate-200 hover:bg-slate-700"
+                  onClick={() => changePage(Math.max(1, currentPage - 1))}
                   disabled={currentPage === 1}
                 >
                   Previous
                 </Button>
-                <span className="text-sm text-slate-600">
-                  Page {currentPage} / {totalPages}
+                <span className="text-sm text-slate-400">
+                  {currentPage} / {totalPages}
                 </span>
                 <Button
                   variant="outline"
                   size="sm"
-                  onClick={() => setCurrentPage((page) => Math.min(totalPages, page + 1))}
+                  className="border-slate-700 bg-slate-800 text-slate-200 hover:bg-slate-700"
+                  onClick={() => changePage(Math.min(totalPages, currentPage + 1))}
                   disabled={currentPage === totalPages}
                 >
                   Next
@@ -613,37 +776,167 @@ export default function App() {
               </div>
             </div>
           ) : null}
-        </CardContent>
-      </Card>
+        </div>
+      </main>
+
+      {/* Settings modal */}
+      {showAutomationSettings ? (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4 backdrop-blur-sm"
+          onClick={() => setShowAutomationSettings(false)}
+        >
+          <div
+            className="max-h-[80vh] w-full max-w-3xl overflow-hidden rounded-xl border border-slate-800 bg-slate-900 shadow-2xl"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="flex items-center justify-between border-b border-slate-800 p-4">
+              <div>
+                <p className="text-lg font-semibold text-slate-100">Settings</p>
+                <p className="text-sm text-slate-500">Configure watchlist automation and Plex integration.</p>
+              </div>
+              <Button
+                variant="outline"
+                size="sm"
+                className="border-slate-700 bg-slate-800 text-slate-200 hover:bg-slate-700"
+                onClick={() => setShowAutomationSettings(false)}
+              >
+                Close
+              </Button>
+            </div>
+
+            <div className="max-h-[65vh] overflow-y-auto p-4">
+              <div className="mb-3 flex flex-wrap items-center gap-2">
+                <Button
+                  variant={settings.autoEnabled ? "default" : "outline"}
+                  size="sm"
+                  className={
+                    settings.autoEnabled
+                      ? "border border-emerald-500/70 bg-emerald-500/80 text-emerald-50 hover:bg-emerald-500"
+                      : "border-slate-700 bg-slate-800 text-slate-200 hover:bg-slate-700"
+                  }
+                  onClick={() => setSettings((current) => ({ ...current, autoEnabled: !current.autoEnabled }))}
+                >
+                  {settings.autoEnabled ? "Automation enabled" : "Automation disabled"}
+                </Button>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  className="border-slate-700 bg-slate-800 text-slate-200 hover:bg-slate-700"
+                  onClick={() => void runAutoNow()}
+                  disabled={autoStatus.isRunning}
+                >
+                  {autoStatus.isRunning ? "Auto running..." : "Run auto now"}
+                </Button>
+                <span className="rounded-full border border-slate-700 bg-slate-800 px-2 py-1 text-xs text-slate-400">
+                  Last run: {autoStatus.lastRunAt ? formatDate(autoStatus.lastRunAt) : "never"}
+                </span>
+                {autoStatus.lastRunMessage ? (
+                  <span className="rounded-full border border-slate-700 bg-slate-800 px-2 py-1 text-xs text-slate-400">
+                    {autoStatus.lastRunMessage}
+                  </span>
+                ) : null}
+              </div>
+
+              <div className="grid grid-cols-1 gap-2 md:grid-cols-2">
+                <Input
+                  value={settings.outputDir}
+                  onChange={(event) => setSettings((current) => ({ ...current, outputDir: event.target.value }))}
+                  placeholder="Output folder for downloads"
+                  className="h-9 border-slate-700 bg-slate-800 text-slate-100 placeholder:text-slate-500"
+                />
+                <Input
+                  type="number"
+                  value={String(settings.autoIntervalMinutes)}
+                  onChange={(event) =>
+                    setSettings((current) => ({
+                      ...current,
+                      autoIntervalMinutes: Math.max(5, Number(event.target.value) || 60),
+                    }))
+                  }
+                  placeholder="Auto interval (minutes)"
+                  className="h-9 border-slate-700 bg-slate-800 text-slate-100 placeholder:text-slate-500"
+                />
+                <Input
+                  value={settings.plexBaseUrl}
+                  onChange={(event) => setSettings((current) => ({ ...current, plexBaseUrl: event.target.value }))}
+                  placeholder="Plex base URL, e.g. http://truenas:32400"
+                  className="h-9 border-slate-700 bg-slate-800 text-slate-100 placeholder:text-slate-500"
+                />
+                <Input
+                  value={settings.plexLibrarySectionId}
+                  onChange={(event) =>
+                    setSettings((current) => ({ ...current, plexLibrarySectionId: event.target.value }))
+                  }
+                  placeholder="Plex library section id"
+                  className="h-9 border-slate-700 bg-slate-800 text-slate-100 placeholder:text-slate-500"
+                />
+                <Input
+                  value={settings.plexToken}
+                  onChange={(event) => setSettings((current) => ({ ...current, plexToken: event.target.value }))}
+                  placeholder="Plex token"
+                  className="h-9 border-slate-700 bg-slate-800 text-slate-100 placeholder:text-slate-500"
+                />
+                <Input
+                  value={settings.plexLibraryPath}
+                  onChange={(event) => setSettings((current) => ({ ...current, plexLibraryPath: event.target.value }))}
+                  placeholder="Optional Plex path filter"
+                  className="h-9 border-slate-700 bg-slate-800 text-slate-100 placeholder:text-slate-500"
+                />
+              </div>
+              <div className="mt-3">
+                <Button
+                  size="sm"
+                  onClick={() => void saveSettings()}
+                  disabled={isSavingSettings}
+                  className="border border-slate-700 bg-slate-100 text-slate-900 hover:bg-white"
+                >
+                  {isSavingSettings ? "Saving..." : "Save settings"}
+                </Button>
+              </div>
+            </div>
+          </div>
+        </div>
+      ) : null}
 
       {selectedSid ? (
         <div
-          className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4"
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4 backdrop-blur-sm"
           onClick={() => setSelectedSid(null)}
         >
           <div
-            className="max-h-[80vh] w-full max-w-3xl overflow-hidden rounded-lg bg-white shadow-xl"
+            className="max-h-[80vh] w-full max-w-3xl overflow-hidden rounded-xl border border-slate-800 bg-slate-900 shadow-2xl"
             onClick={(event) => event.stopPropagation()}
           >
-            <div className="flex items-center justify-between border-b border-slate-200 p-4">
+            <div className="flex items-center justify-between border-b border-slate-800 p-4">
               <div>
-                <p className="text-lg font-semibold text-slate-900">
-                  {getGroupTitle(episodesForSelectedSid)}
-                </p>
+                <p className="text-lg font-semibold text-slate-100">{getGroupTitle(episodesForSelectedSid)}</p>
                 <p className="text-sm text-slate-500">SID {selectedSid}</p>
               </div>
               <div className="flex items-center gap-2">
                 <Button
                   size="sm"
-                  variant={selectedSidFollowed ? "default" : "outline"}
+                  className={
+                    selectedSidFollowed
+                      ? "border border-sky-600/60 bg-sky-600/80 text-sky-50 hover:bg-rose-600/80 hover:border-rose-600/60 hover:text-rose-50"
+                      : "border-slate-700 bg-slate-800 text-slate-200 hover:bg-slate-700"
+                  }
                   onClick={() => {
                     if (!selectedSid) return;
                     void toggleFollowSid(selectedSid, !selectedSidFollowed);
                   }}
                 >
-                  {selectedSidFollowed ? "Following" : "Follow"}
+                  {selectedSidFollowed ? (
+                    <><Check className="mr-2 h-4 w-4" />Following</>
+                  ) : (
+                    <><Plus className="mr-2 h-4 w-4" />Follow</>
+                  )}
                 </Button>
-                <Button variant="outline" size="sm" onClick={() => setSelectedSid(null)}>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="border-slate-700 bg-slate-800 text-slate-200 hover:bg-slate-700"
+                  onClick={() => setSelectedSid(null)}
+                >
                   Close
                 </Button>
               </div>
@@ -656,30 +949,43 @@ export default function App() {
                   {episodesForSelectedSid.map((episode) => (
                     <li
                       key={episode.pid}
-                      className="flex items-center justify-between gap-3 rounded-md border border-slate-200 p-3"
+                      className="flex items-center justify-between gap-3 rounded-md border border-slate-800 bg-slate-900/70 p-3"
                     >
                       <div className="min-w-0">
-                        <p className="truncate font-medium text-slate-900">{episode.title}</p>
+                        <p className="truncate font-medium text-slate-100">{episode.title}</p>
                         <p className="text-sm text-slate-500">
                           PID {episode.pid} - {formatDate(episode.publishedAt)}
                         </p>
                       </div>
-                      <Button
-                        variant="secondary"
-                        size="sm"
-                        onClick={() => void handleDownload(episode)}
-                        disabled={isDownloading !== null}
-                        className="relative overflow-hidden"
-                      >
-                        <span
-                          className="absolute bottom-0 left-0 h-1 bg-slate-300 transition-[width] duration-200"
-                          style={{ width: `${downloadProgress[episode.pid] ?? 0}%` }}
-                        />
-                        <Download className="mr-2 h-4 w-4" />
-                        {isDownloading === episode.pid
-                          ? `Downloading ${Math.round(downloadProgress[episode.pid] ?? 0)}%`
-                          : "Download"}
-                      </Button>
+                      <div className="flex items-center gap-2">
+                        <Button
+                          variant="secondary"
+                          size="sm"
+                          onClick={() => void handleDownload(episode, "web")}
+                          disabled={isDownloading !== null}
+                          className="relative h-8 overflow-hidden border border-sky-600/60 bg-sky-600/90 text-sky-50 hover:bg-sky-500"
+                        >
+                          <span
+                            className="absolute bottom-0 left-0 h-1 bg-sky-200/50 transition-[width] duration-200"
+                            style={{ width: `${downloadProgress[episode.pid] ?? 0}%` }}
+                          />
+                          <Download className="mr-2 h-4 w-4" />
+                          {isDownloading === episode.pid ? "Downloading..." : "Download"}
+                        </Button>
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          onClick={() => void handleDownload(episode, "library")}
+                          disabled={isDownloading !== null}
+                          className="relative h-7 border-slate-700 bg-slate-800 px-2 text-xs text-slate-200 hover:bg-slate-700"
+                        >
+                          <span
+                            className="absolute bottom-0 left-0 h-1 bg-sky-500/60 transition-[width] duration-200"
+                            style={{ width: `${downloadProgress[episode.pid] ?? 0}%` }}
+                          />
+                          {isDownloading === episode.pid ? "..." : "Library"}
+                        </Button>
+                      </div>
                     </li>
                   ))}
                 </ul>
@@ -688,6 +994,6 @@ export default function App() {
           </div>
         </div>
       ) : null}
-    </main>
+    </div>
   );
 }

@@ -9,8 +9,10 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from mimetypes import guess_type
 from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import parse_qs, quote, urlparse
@@ -83,9 +85,22 @@ class ApiRuntime:
         )
         self.settings = self._load_settings()
         self.status = _default_status()
+        self.web_download_dir = (Path.cwd() / "downloads" / "_web_tmp").resolve()
+        self.web_download_dir.mkdir(parents=True, exist_ok=True)
+        self.web_download_tokens: dict[str, Path] = {}
         self._last_auto_run_unix = 0.0
         self._scheduler_thread = threading.Thread(target=self._scheduler_loop, daemon=True)
         self._scheduler_thread.start()
+
+    def register_web_download_file(self, file_path: Path) -> str:
+        token = uuid.uuid4().hex
+        with self._lock:
+            self.web_download_tokens[token] = file_path
+        return token
+
+    def pop_web_download_file(self, token: str) -> Path | None:
+        with self._lock:
+            return self.web_download_tokens.pop(token, None)
 
     def _load_settings(self) -> dict:
         defaults = _default_settings()
@@ -277,6 +292,16 @@ def _search_schedule(schedule: dict, query: str | None, watchlist_sids: list[str
     for item in items:
         show_title = ruvsarpur.createShowTitle(item, False)
         series_title = _normalize_series_title(item.get("series_title") or show_title)
+        slug = str(item.get("slug", "")).strip()
+        pid = str(item.get("pid", "")).strip()
+        web_url = f"https://www.ruv.is/sjonvarp/spila/{slug}/{pid}" if slug and pid else "https://www.ruv.is/sjonvarp"
+        content_type = (
+            "movie_or_docu"
+            if item.get("is_movie") or item.get("is_docu")
+            else "sport"
+            if item.get("is_sport")
+            else "show"
+        )
         results.append(
             {
                 "pid": str(item.get("pid", "")),
@@ -284,14 +309,17 @@ def _search_schedule(schedule: dict, query: str | None, watchlist_sids: list[str
                 "title": show_title,
                 "seriesTitle": series_title,
                 "publishedAt": item.get("showtime"),
+                "webUrl": web_url,
+                # Prefer portrait-style artwork for poster card rendering.
                 "posterUrl": item.get("portrait_image") or item.get("series_image") or item.get("episode_image"),
                 "isFollowed": str(item.get("sid", "")) in watchlist_sids,
+                "contentType": content_type,
             }
         )
     return results
 
 
-def _run_download(pid: str, output_dir: str) -> tuple[bool, str]:
+def _run_download(pid: str, output_dir: str, portable: bool, mode: str) -> tuple[bool, str]:
     script_path = Path(__file__).resolve().parent / "ruvsarpur.py"
     command = [
         sys.executable,
@@ -301,10 +329,42 @@ def _run_download(pid: str, output_dir: str) -> tuple[bool, str]:
         "--output",
         output_dir,
     ]
+    if mode == "library":
+        command.append("--checklocal")
+        command.append("--plex")
+    else:
+        # Web mode should always materialize a local file in the target folder.
+        command.append("--force")
+    if portable:
+        command.append("--portable")
     proc = subprocess.run(command, capture_output=True, text=True)
     if proc.returncode != 0:
         return False, proc.stderr.strip() or proc.stdout.strip() or "Download failed"
-    return True, "Download completed"
+    if mode == "library":
+        return True, "Library download completed"
+    return True, "Web download completed"
+
+
+def _find_latest_downloaded_video(output_dir: str, pid: str) -> Path | None:
+    output_path = Path(output_dir)
+    if not output_path.exists():
+        return None
+    video_extensions = {".mp4", ".mkv", ".webm", ".mov", ".m4v"}
+    candidates: list[Path] = []
+    for candidate in output_path.rglob("*"):
+        if not candidate.is_file():
+            continue
+        if candidate.suffix.lower() not in video_extensions:
+            continue
+        if pid and pid in candidate.name:
+            candidates.append(candidate)
+    if len(candidates) == 0:
+        for candidate in output_path.rglob("*"):
+            if candidate.is_file() and candidate.suffix.lower() in video_extensions:
+                candidates.append(candidate)
+    if len(candidates) == 0:
+        return None
+    return max(candidates, key=lambda item: item.stat().st_mtime)
 
 
 def create_handler(config: ApiConfig, runtime: ApiRuntime):
@@ -349,6 +409,33 @@ def create_handler(config: ApiConfig, runtime: ApiRuntime):
 
             if parsed.path == "/api/auto/status":
                 _json_response(self, 200, {"status": runtime.get_status()})
+                return
+
+            if parsed.path == "/api/download-file":
+                query_params = parse_qs(parsed.query)
+                token = str(query_params.get("token", [""])[0]).strip()
+                if not token:
+                    _json_response(self, 400, {"error": "Query parameter 'token' is required"})
+                    return
+                file_path = runtime.pop_web_download_file(token)
+                if file_path is None or not file_path.exists() or not file_path.is_file():
+                    _json_response(self, 404, {"error": "Download token expired or file not found"})
+                    return
+                mime_type = guess_type(file_path.name)[0] or "application/octet-stream"
+                try:
+                    file_bytes = file_path.read_bytes()
+                except Exception as ex:
+                    _json_response(self, 500, {"error": f"Could not read download file: {ex}"})
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type", mime_type)
+                self.send_header("Content-Length", str(len(file_bytes)))
+                self.send_header("Content-Disposition", f'attachment; filename="{file_path.name}"')
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.send_header("Access-Control-Allow-Headers", "Content-Type")
+                self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
+                self.end_headers()
+                self.wfile.write(file_bytes)
                 return
 
             _json_response(self, 404, {"error": "Not found"})
@@ -397,20 +484,42 @@ def create_handler(config: ApiConfig, runtime: ApiRuntime):
 
             pid = str((body or {}).get("pid", "")).strip()
             output_dir = str((body or {}).get("outputDir", "")).strip()
+            mode = str((body or {}).get("mode", "library")).strip().lower()
             if not pid:
                 _json_response(self, 400, {"error": "Field 'pid' is required"})
                 return
+            if mode not in {"web", "library"}:
+                _json_response(self, 400, {"error": "Field 'mode' must be 'web' or 'library'"})
+                return
 
             if not output_dir:
-                output_dir = runtime.get_settings().get("outputDir") or str((Path.cwd() / "downloads").resolve())
+                if mode == "web":
+                    # Web mode uses a temporary server-side directory and then streams the file to browser.
+                    output_dir = str(runtime.web_download_dir)
+                else:
+                    output_dir = runtime.get_settings().get("outputDir") or str((Path.cwd() / "downloads").resolve())
 
             os.makedirs(output_dir, exist_ok=True)
-            ok, message = _run_download(pid=pid, output_dir=output_dir)
+            ok, message = _run_download(
+                pid=pid,
+                output_dir=output_dir,
+                portable=config.portable,
+                mode=mode,
+            )
             if not ok:
                 _json_response(self, 500, {"error": message})
                 return
 
-            _json_response(self, 200, {"ok": True, "message": message, "outputDir": output_dir, "pid": pid})
+            payload = {"ok": True, "message": message, "outputDir": output_dir, "pid": pid, "mode": mode}
+            if mode == "web":
+                downloaded_file = _find_latest_downloaded_video(output_dir=output_dir, pid=pid)
+                if downloaded_file is None:
+                    _json_response(self, 500, {"error": "Web download completed but no local video file was found"})
+                    return
+                token = runtime.register_web_download_file(downloaded_file)
+                payload["downloadUrl"] = f"/api/download-file?token={token}"
+                payload["fileName"] = downloaded_file.name
+            _json_response(self, 200, payload)
 
         def do_DELETE(self) -> None:  # noqa: N802
             parsed = urlparse(self.path)

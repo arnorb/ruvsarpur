@@ -2,7 +2,7 @@
 @import "tailwindcss";
 
 :root {
-  color-scheme: light;
+  color-scheme: dark;
 }
 
 body {
@@ -13,6 +13,10 @@ body {
     BlinkMacSystemFont,
     "Segoe UI",
     sans-serif;
-  background: #f8fafc;
-  color: #0f172a;
+  background: #020617;
+  color: #e2e8f0;
+}
+
+#root {
+  min-height: 100vh;
 }
