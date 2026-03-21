@@ -101,3 +101,7 @@ src/ruv-eldar.bat
 # Runtime/cache data
 data/imdb-cache.json
 data/poster-cache/
+
+# Keep python/package lib directories ignored, but allow frontend source helpers.
+!frontend/src/lib/
+!frontend/src/lib/**
