@@ -105,3 +105,5 @@ data/poster-cache/
 # Keep python/package lib directories ignored, but allow frontend source helpers.
 !frontend/src/lib/
 !frontend/src/lib/**
+.DS_Store
+data/.DS_Store
