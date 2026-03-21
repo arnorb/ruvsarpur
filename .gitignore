@@ -97,3 +97,7 @@ src/ruv-eldar.bat
 #IntelliJ IDEA specific files
 /ruvsarpur.iml
 /.idea/
+
+# Runtime/cache data
+data/imdb-cache.json
+data/poster-cache/

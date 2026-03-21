@@ -21,6 +21,10 @@ type AutoSettings = {
   autoEnabled: boolean;
   autoIntervalMinutes: number;
   outputDir: string;
+  libraryRootDir: string;
+  showsSubdir: string;
+  moviesSubdir: string;
+  sportsSubdir: string;
   plexBaseUrl: string;
   plexToken: string;
   plexLibrarySectionId: string;
@@ -47,6 +51,40 @@ const CONTENT_GROUP_LABEL: Record<"movie_or_docu" | "sport" | "show", string> = 
   sport: "Sports",
   show: "Shows",
 };
+
+function toApiUrl(pathOrUrl: string): string {
+  if (pathOrUrl.startsWith("http://") || pathOrUrl.startsWith("https://")) {
+    return pathOrUrl;
+  }
+  if (pathOrUrl.startsWith("/")) {
+    return `${API_BASE_URL}${pathOrUrl}`;
+  }
+  return `${API_BASE_URL}/${pathOrUrl}`;
+}
+
+async function parseApiResponse<T extends { error?: string }>(response: Response): Promise<T> {
+  const contentType = response.headers.get("Content-Type")?.toLowerCase() ?? "";
+  if (contentType.includes("application/json")) {
+    return (await response.json()) as T;
+  }
+
+  const rawBody = (await response.text()).trim();
+  const normalizedBody = rawBody.replace(/\s+/g, " ").trim();
+  if (!response.ok) {
+    if (response.status === 504) {
+      return {
+        error: "Refresh request timed out at the web proxy. The backend may still be processing. Try again shortly.",
+      } as T;
+    }
+    return {
+      error:
+        normalizedBody.slice(0, 220) ||
+        `Request failed (${response.status}). API returned a non-JSON response.`,
+    } as T;
+  }
+
+  throw new Error("API returned a non-JSON response");
+}
 
 function formatDate(isoDate: string): string {
   if (!isoDate) return "Unknown date";
@@ -85,7 +123,9 @@ function getGroupTitle(sidShows: ShowItem[]): string {
 }
 
 function getGroupPosterUrl(sidShows: ShowItem[]): string | null {
-  return sidShows.find((show) => !!show.posterUrl)?.posterUrl ?? null;
+  const rawPosterUrl = sidShows.find((show) => !!show.posterUrl)?.posterUrl ?? null;
+  if (!rawPosterUrl) return null;
+  return toApiUrl(rawPosterUrl);
 }
 
 function getGroupContentType(sidShows: ShowItem[]): "movie_or_docu" | "sport" | "show" {
@@ -114,6 +154,10 @@ export default function App() {
     autoEnabled: false,
     autoIntervalMinutes: 60,
     outputDir: "",
+    libraryRootDir: "",
+    showsSubdir: "shows",
+    moviesSubdir: "movies",
+    sportsSubdir: "sports",
     plexBaseUrl: "",
     plexToken: "",
     plexLibrarySectionId: "",
@@ -244,7 +288,7 @@ export default function App() {
     try {
       const queryParam = encodeURIComponent(query.trim());
       const response = await fetch(`${API_BASE_URL}/api/shows?query=${queryParam}&refresh=${refresh ? "1" : "0"}`);
-      const data = (await response.json()) as { shows?: ShowItem[]; error?: string };
+      const data = await parseApiResponse<{ shows?: ShowItem[]; error?: string }>(response);
       if (!response.ok) {
         throw new Error(data.error ?? "Failed to fetch shows");
       }
@@ -266,7 +310,7 @@ export default function App() {
   const loadSettings = async () => {
     try {
       const response = await fetch(`${API_BASE_URL}/api/settings`);
-      const data = (await response.json()) as { settings?: AutoSettings; status?: AutoStatus; error?: string };
+      const data = await parseApiResponse<{ settings?: AutoSettings; status?: AutoStatus; error?: string }>(response);
       if (!response.ok) throw new Error(data.error ?? "Failed to load settings");
       if (data.settings) setSettings(data.settings);
       if (data.status) setAutoStatus(data.status);
@@ -285,7 +329,7 @@ export default function App() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(settings),
       });
-      const data = (await response.json()) as { settings?: AutoSettings; error?: string };
+      const data = await parseApiResponse<{ settings?: AutoSettings; error?: string }>(response);
       if (!response.ok) throw new Error(data.error ?? "Failed to save settings");
       if (data.settings) setSettings(data.settings);
       setStatusMessage("Automation settings saved.");
@@ -300,7 +344,7 @@ export default function App() {
   const fetchAutoStatus = async () => {
     try {
       const response = await fetch(`${API_BASE_URL}/api/auto/status`);
-      const data = (await response.json()) as { status?: AutoStatus; error?: string };
+      const data = await parseApiResponse<{ status?: AutoStatus; error?: string }>(response);
       if (!response.ok) throw new Error(data.error ?? "Failed to load auto status");
       if (data.status) setAutoStatus(data.status);
     } catch {
@@ -312,7 +356,7 @@ export default function App() {
     setErrorMessage("");
     try {
       const response = await fetch(`${API_BASE_URL}/api/auto/run-now`, { method: "POST" });
-      const data = (await response.json()) as { message?: string; error?: string };
+      const data = await parseApiResponse<{ message?: string; error?: string }>(response);
       if (!response.ok) throw new Error(data.error ?? "Failed to start auto run");
       setStatusMessage(data.message ?? "Auto download started.");
       await fetchAutoStatus();
@@ -340,14 +384,14 @@ export default function App() {
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ sid }),
         });
-        const data = (await response.json()) as { watchlistSids?: string[]; error?: string };
+        const data = await parseApiResponse<{ watchlistSids?: string[]; error?: string }>(response);
         if (!response.ok) throw new Error(data.error ?? "Failed to follow series");
         setSettings((current) => ({ ...current, watchlistSids: data.watchlistSids ?? current.watchlistSids }));
       } else {
         const response = await fetch(`${API_BASE_URL}/api/watchlist?sid=${encodeURIComponent(sid)}`, {
           method: "DELETE",
         });
-        const data = (await response.json()) as { watchlistSids?: string[]; error?: string };
+        const data = await parseApiResponse<{ watchlistSids?: string[]; error?: string }>(response);
         if (!response.ok) throw new Error(data.error ?? "Failed to unfollow series");
         setSettings((current) => ({ ...current, watchlistSids: data.watchlistSids ?? current.watchlistSids }));
       }
@@ -367,15 +411,15 @@ export default function App() {
       const response = await fetch(`${API_BASE_URL}/api/download`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ pid: show.pid, mode }),
+        body: JSON.stringify({ pid: show.pid, mode, contentType: show.contentType ?? "show" }),
       });
-      const data = (await response.json()) as {
+      const data = await parseApiResponse<{
         message?: string;
         error?: string;
         outputDir?: string;
         downloadUrl?: string;
         fileName?: string;
-      };
+      }>(response);
       if (!response.ok) {
         throw new Error(data.error ?? "Download failed");
       }
@@ -705,7 +749,7 @@ export default function App() {
                                 )}
                                 {/* Follow bar — shown on hover, or always visible when already followed */}
                                 <div
-                                  className={`absolute inset-x-0 bottom-0 flex items-center justify-center bg-gradient-to-t from-black/90 to-transparent px-2 pb-2 pt-6 transition-opacity duration-200 ${
+                                  className={`absolute inset-x-0 bottom-0 flex items-center justify-center bg-linear-to-t from-black/90 to-transparent px-2 pb-2 pt-6 transition-opacity duration-200 ${
                                     isSidFollowed(sidShows) ? "opacity-100" : "opacity-0 group-hover:opacity-100"
                                   }`}
                                   onClick={(event) => event.stopPropagation()}
@@ -839,9 +883,9 @@ export default function App() {
 
               <div className="grid grid-cols-1 gap-2 md:grid-cols-2">
                 <Input
-                  value={settings.outputDir}
-                  onChange={(event) => setSettings((current) => ({ ...current, outputDir: event.target.value }))}
-                  placeholder="Output folder for downloads"
+                  value={settings.libraryRootDir}
+                  onChange={(event) => setSettings((current) => ({ ...current, libraryRootDir: event.target.value }))}
+                  placeholder="Library root folder, e.g. /data/media/ruv"
                   className="h-9 border-slate-700 bg-slate-800 text-slate-100 placeholder:text-slate-500"
                 />
                 <Input
@@ -854,6 +898,24 @@ export default function App() {
                     }))
                   }
                   placeholder="Auto interval (minutes)"
+                  className="h-9 border-slate-700 bg-slate-800 text-slate-100 placeholder:text-slate-500"
+                />
+                <Input
+                  value={settings.showsSubdir}
+                  onChange={(event) => setSettings((current) => ({ ...current, showsSubdir: event.target.value }))}
+                  placeholder="Shows subfolder (under library root)"
+                  className="h-9 border-slate-700 bg-slate-800 text-slate-100 placeholder:text-slate-500"
+                />
+                <Input
+                  value={settings.moviesSubdir}
+                  onChange={(event) => setSettings((current) => ({ ...current, moviesSubdir: event.target.value }))}
+                  placeholder="Movies subfolder (under library root)"
+                  className="h-9 border-slate-700 bg-slate-800 text-slate-100 placeholder:text-slate-500"
+                />
+                <Input
+                  value={settings.sportsSubdir}
+                  onChange={(event) => setSettings((current) => ({ ...current, sportsSubdir: event.target.value }))}
+                  placeholder="Sports subfolder (under library root)"
                   className="h-9 border-slate-700 bg-slate-800 text-slate-100 placeholder:text-slate-500"
                 />
                 <Input

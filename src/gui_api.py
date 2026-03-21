@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import datetime
+import hashlib
 import json
 import os
 import re
@@ -15,8 +16,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from mimetypes import guess_type
 from pathlib import Path
 from types import SimpleNamespace
-from urllib.parse import parse_qs, quote, urlparse
-from urllib.request import urlopen
+from urllib.parse import parse_qs, quote, urlencode, urlparse
+from urllib.request import Request, urlopen
 
 import ruvsarpur
 
@@ -29,6 +30,13 @@ class ApiConfig:
 
 
 RE_TRAILING_PARENTHESIS = re.compile(r"\s*\([^)]*\)\s*$")
+POSTER_CACHE_TTL = datetime.timedelta(hours=24)
+POSTER_CACHE_MAX_FILES = 3000
+POSTER_ALLOWED_HOSTS = {
+    "myndir.ruv.is",
+    "d38kdhuogyllre.cloudfront.net",
+    "m.media-amazon.com",
+}
 
 
 def _default_settings() -> dict:
@@ -37,6 +45,10 @@ def _default_settings() -> dict:
         "autoEnabled": False,
         "autoIntervalMinutes": 60,
         "outputDir": str((Path.cwd() / "downloads").resolve()),
+        "libraryRootDir": str((Path.cwd() / "downloads").resolve()),
+        "showsSubdir": "shows",
+        "moviesSubdir": "movies",
+        "sportsSubdir": "sports",
         "plexBaseUrl": "",
         "plexToken": "",
         "plexLibrarySectionId": "",
@@ -76,6 +88,43 @@ def _json_response(handler: BaseHTTPRequestHandler, status: int, payload: dict) 
     handler.wfile.write(body)
 
 
+def _detect_image_mime(file_name: str, file_bytes: bytes) -> str:
+    # Purpose: derive an accurate image content-type even when URL paths have no extension.
+    if len(file_bytes) >= 12 and file_bytes[:4] == b"RIFF" and file_bytes[8:12] == b"WEBP":
+        return "image/webp"
+    if len(file_bytes) >= 8 and file_bytes[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png"
+    if len(file_bytes) >= 3 and file_bytes[:3] == b"\xff\xd8\xff":
+        return "image/jpeg"
+    return guess_type(file_name)[0] or "application/octet-stream"
+
+
+def _content_type_from_item(item: dict) -> str:
+    if item.get("is_movie") or item.get("is_docu"):
+        return "movie_or_docu"
+    if item.get("is_sport"):
+        return "sport"
+    return "show"
+
+
+def _resolve_library_output_dir(settings: dict, content_type: str) -> str:
+    # Purpose: map library downloads to category folders under one configurable root.
+    root_dir = str(settings.get("libraryRootDir", "")).strip() or str(
+        settings.get("outputDir", "") or (Path.cwd() / "downloads").resolve()
+    )
+    category_subdir_key = {
+        "show": "showsSubdir",
+        "movie_or_docu": "moviesSubdir",
+        "sport": "sportsSubdir",
+    }.get(content_type, "showsSubdir")
+    category_subdir = str(settings.get(category_subdir_key, "")).strip()
+    if len(category_subdir) == 0:
+        return str(Path(root_dir).resolve())
+    if Path(category_subdir).is_absolute():
+        return str(Path(category_subdir).resolve())
+    return str((Path(root_dir) / category_subdir).resolve())
+
+
 class ApiRuntime:
     def __init__(self, config: ApiConfig):
         self.config = config
@@ -88,9 +137,109 @@ class ApiRuntime:
         self.web_download_dir = (Path.cwd() / "downloads" / "_web_tmp").resolve()
         self.web_download_dir.mkdir(parents=True, exist_ok=True)
         self.web_download_tokens: dict[str, Path] = {}
+        self.poster_cache_dir = (self.settings_file.parent / "poster-cache").resolve()
+        self.poster_cache_dir.mkdir(parents=True, exist_ok=True)
+        self._last_poster_cleanup_unix = 0.0
         self._last_auto_run_unix = 0.0
+        self._cleanup_poster_cache()
         self._scheduler_thread = threading.Thread(target=self._scheduler_loop, daemon=True)
         self._scheduler_thread.start()
+
+    def get_poster_api_path(self, poster_url: str | None) -> str | None:
+        normalized_url = self._normalize_poster_url(poster_url)
+        if normalized_url is None:
+            return None
+        return f"/api/poster?{urlencode({'url': normalized_url})}"
+
+    def get_cached_poster_file(self, poster_url: str | None) -> tuple[Path | None, str | None]:
+        normalized_url = self._normalize_poster_url(poster_url)
+        if normalized_url is None:
+            return None, "Invalid or unsupported poster URL"
+        self._maybe_cleanup_poster_cache()
+        cache_file = self._poster_cache_file_path(normalized_url)
+        now_utc = datetime.datetime.utcnow()
+        with self._lock:
+            if self._is_poster_cache_fresh(cache_file, now_utc):
+                return cache_file, None
+        try:
+            request = Request(normalized_url, headers={"User-Agent": "ruvsarpur/1.0"})
+            with urlopen(request, timeout=10) as response:
+                if response.status < 200 or response.status >= 300:
+                    return None, f"Poster download failed (HTTP {response.status})"
+                payload = response.read()
+                if len(payload) == 0:
+                    return None, "Poster download failed (empty file)"
+        except Exception as ex:
+            # If remote fetch fails, serving stale local artwork is better than no artwork.
+            with self._lock:
+                if cache_file.exists() and cache_file.is_file():
+                    return cache_file, None
+            return None, f"Poster download failed: {ex}"
+
+        temp_file = cache_file.with_suffix(f"{cache_file.suffix}.tmp")
+        with self._lock:
+            try:
+                temp_file.write_bytes(payload)
+                temp_file.replace(cache_file)
+            finally:
+                if temp_file.exists():
+                    try:
+                        temp_file.unlink()
+                    except Exception:
+                        pass
+        return cache_file, None
+
+    def _normalize_poster_url(self, poster_url: str | None) -> str | None:
+        if not poster_url:
+            return None
+        parsed = urlparse(str(poster_url).strip())
+        if parsed.scheme != "https":
+            return None
+        host = (parsed.hostname or "").lower()
+        if host not in POSTER_ALLOWED_HOSTS:
+            return None
+        return parsed.geturl()
+
+    def _poster_cache_file_path(self, normalized_url: str) -> Path:
+        parsed = urlparse(normalized_url)
+        _, ext = os.path.splitext(parsed.path or "")
+        safe_ext = ext.lower() if ext.lower() in {".jpg", ".jpeg", ".png", ".webp"} else ".jpg"
+        digest = hashlib.sha256(normalized_url.encode("utf-8")).hexdigest()
+        return self.poster_cache_dir / f"{digest}{safe_ext}"
+
+    def _is_poster_cache_fresh(self, cache_file: Path, now_utc: datetime.datetime) -> bool:
+        if not cache_file.exists() or not cache_file.is_file():
+            return False
+        age = now_utc - datetime.datetime.utcfromtimestamp(cache_file.stat().st_mtime)
+        return age <= POSTER_CACHE_TTL
+
+    def _cleanup_poster_cache(self) -> None:
+        with self._lock:
+            self._last_poster_cleanup_unix = time.time()
+            files = [item for item in self.poster_cache_dir.glob("*") if item.is_file()]
+            now_utc = datetime.datetime.utcnow()
+            for item in files:
+                try:
+                    age = now_utc - datetime.datetime.utcfromtimestamp(item.stat().st_mtime)
+                    if age > POSTER_CACHE_TTL:
+                        item.unlink(missing_ok=True)
+                except Exception:
+                    continue
+            files = [item for item in self.poster_cache_dir.glob("*") if item.is_file()]
+            if len(files) <= POSTER_CACHE_MAX_FILES:
+                return
+            files = sorted(files, key=lambda item: item.stat().st_mtime)
+            overflow = len(files) - POSTER_CACHE_MAX_FILES
+            for item in files[:overflow]:
+                try:
+                    item.unlink(missing_ok=True)
+                except Exception:
+                    continue
+
+    def _maybe_cleanup_poster_cache(self) -> None:
+        if time.time() - self._last_poster_cleanup_unix < 3600:
+            return
+        self._cleanup_poster_cache()
 
     def register_web_download_file(self, file_path: Path) -> str:
         token = uuid.uuid4().hex
@@ -108,6 +257,11 @@ class ApiRuntime:
         if not isinstance(existing, dict):
             return defaults
         merged = {**defaults, **existing}
+        # Keep previous single-folder config working after introducing category folders.
+        if len(str(existing.get("libraryRootDir", "")).strip()) == 0 and len(
+            str(existing.get("outputDir", "")).strip()
+        ) > 0:
+            merged["libraryRootDir"] = str(existing.get("outputDir", "")).strip()
         merged["watchlistSids"] = [str(sid) for sid in merged.get("watchlistSids", []) if sid]
         merged["autoIntervalMinutes"] = max(5, int(merged.get("autoIntervalMinutes", 60)))
         return merged
@@ -212,40 +366,62 @@ class ApiRuntime:
 
         with self._lock:
             watchlist = list(self.settings.get("watchlistSids", []))
-            output_dir = str(self.settings.get("outputDir", "")).strip() or str(
-                (Path.cwd() / "downloads").resolve()
-            )
+            settings_snapshot = dict(self.settings)
             portable = self.config.portable
 
         if len(watchlist) == 0:
             self._set_status(isRunning=False, lastRunStatus="ok", lastRunMessage="No followed series to download")
             return
 
-        os.makedirs(output_dir, exist_ok=True)
-        script_path = Path(__file__).resolve().parent / "ruvsarpur.py"
-        command = [
-            sys.executable,
-            str(script_path),
-            "--sid",
-            *watchlist,
-            "--output",
-            output_dir,
-            "--refresh",
-            "--incremental",
-            "--checklocal",
-            "--plex",
-        ]
-        if portable:
-            command.append("--portable")
+        sid_content_types: dict[str, str] = {}
+        try:
+            schedule = _load_schedule(refresh=False, portable=portable)
+            for item in schedule.values():
+                if not isinstance(item, dict):
+                    continue
+                sid = str(item.get("sid", "")).strip()
+                if sid:
+                    sid_content_types[sid] = _content_type_from_item(item)
+        except Exception:
+            sid_content_types = {}
 
-        proc = subprocess.run(command, capture_output=True, text=True)
-        if proc.returncode != 0:
-            self._set_status(
-                isRunning=False,
-                lastRunStatus="error",
-                lastRunMessage=proc.stderr.strip() or proc.stdout.strip() or "Auto download failed",
-            )
-            return
+        grouped_sids: dict[str, list[str]] = {"show": [], "movie_or_docu": [], "sport": []}
+        for sid in watchlist:
+            grouped_sids[sid_content_types.get(sid, "show")].append(sid)
+
+        script_path = Path(__file__).resolve().parent / "ruvsarpur.py"
+        first_group = True
+        for content_type in ("show", "movie_or_docu", "sport"):
+            group_watchlist = grouped_sids.get(content_type, [])
+            if len(group_watchlist) == 0:
+                continue
+            output_dir = _resolve_library_output_dir(settings_snapshot, content_type)
+            os.makedirs(output_dir, exist_ok=True)
+            command = [
+                sys.executable,
+                str(script_path),
+                "--sid",
+                *group_watchlist,
+                "--output",
+                output_dir,
+                "--incremental",
+                "--checklocal",
+                "--plex",
+            ]
+            if first_group:
+                command.append("--refresh")
+                first_group = False
+            if portable:
+                command.append("--portable")
+
+            proc = subprocess.run(command, capture_output=True, text=True)
+            if proc.returncode != 0:
+                self._set_status(
+                    isRunning=False,
+                    lastRunStatus="error",
+                    lastRunMessage=proc.stderr.strip() or proc.stdout.strip() or "Auto download failed",
+                )
+                return
 
         plex_ok, plex_message = self._run_plex_refresh()
         final_msg = "Auto download completed"
@@ -276,7 +452,12 @@ def _load_schedule(refresh: bool, portable: bool) -> dict:
     return schedule
 
 
-def _search_schedule(schedule: dict, query: str | None, watchlist_sids: list[str]) -> list[dict]:
+def _search_schedule(
+    schedule: dict,
+    query: str | None,
+    watchlist_sids: list[str],
+    runtime: ApiRuntime,
+) -> list[dict]:
     # Reuse the script's own matching implementation to keep CLI and API behavior aligned.
     args = SimpleNamespace(
         sid=None,
@@ -302,6 +483,9 @@ def _search_schedule(schedule: dict, query: str | None, watchlist_sids: list[str
             if item.get("is_sport")
             else "show"
         )
+        resolved_poster_url = runtime.get_poster_api_path(
+            item.get("portrait_image") or item.get("series_image") or item.get("episode_image")
+        )
         results.append(
             {
                 "pid": str(item.get("pid", "")),
@@ -310,8 +494,8 @@ def _search_schedule(schedule: dict, query: str | None, watchlist_sids: list[str
                 "seriesTitle": series_title,
                 "publishedAt": item.get("showtime"),
                 "webUrl": web_url,
-                # Prefer portrait-style artwork for poster card rendering.
-                "posterUrl": item.get("portrait_image") or item.get("series_image") or item.get("episode_image"),
+                # Purpose: route poster images through short-lived local cache for faster UI loads.
+                "posterUrl": resolved_poster_url,
                 "isFollowed": str(item.get("sid", "")) in watchlist_sids,
                 "contentType": content_type,
             }
@@ -393,10 +577,42 @@ def create_handler(config: ApiConfig, runtime: ApiRuntime):
                 try:
                     schedule = _load_schedule(refresh=refresh, portable=config.portable)
                     settings = runtime.get_settings()
-                    shows = _search_schedule(schedule, query, settings.get("watchlistSids", []))
+                    shows = _search_schedule(
+                        schedule,
+                        query,
+                        settings.get("watchlistSids", []),
+                        runtime,
+                    )
                     _json_response(self, 200, {"shows": shows})
                 except Exception as ex:
                     _json_response(self, 500, {"error": str(ex)})
+                return
+
+            if parsed.path == "/api/poster":
+                query_params = parse_qs(parsed.query)
+                poster_url = str(query_params.get("url", [""])[0]).strip()
+                if not poster_url:
+                    _json_response(self, 400, {"error": "Query parameter 'url' is required"})
+                    return
+                poster_file, poster_error = runtime.get_cached_poster_file(poster_url)
+                if poster_file is None:
+                    _json_response(self, 400, {"error": poster_error or "Poster not available"})
+                    return
+                try:
+                    file_bytes = poster_file.read_bytes()
+                except Exception as ex:
+                    _json_response(self, 500, {"error": f"Could not read cached poster file: {ex}"})
+                    return
+                mime_type = _detect_image_mime(poster_file.name, file_bytes)
+                self.send_response(200)
+                self.send_header("Content-Type", mime_type)
+                self.send_header("Content-Length", str(len(file_bytes)))
+                self.send_header("Cache-Control", "public, max-age=86400")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.send_header("Access-Control-Allow-Headers", "Content-Type")
+                self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
+                self.end_headers()
+                self.wfile.write(file_bytes)
                 return
 
             if parsed.path == "/api/settings":
@@ -485,19 +701,22 @@ def create_handler(config: ApiConfig, runtime: ApiRuntime):
             pid = str((body or {}).get("pid", "")).strip()
             output_dir = str((body or {}).get("outputDir", "")).strip()
             mode = str((body or {}).get("mode", "library")).strip().lower()
+            content_type = str((body or {}).get("contentType", "show")).strip().lower()
             if not pid:
                 _json_response(self, 400, {"error": "Field 'pid' is required"})
                 return
             if mode not in {"web", "library"}:
                 _json_response(self, 400, {"error": "Field 'mode' must be 'web' or 'library'"})
                 return
+            if content_type not in {"show", "movie_or_docu", "sport"}:
+                content_type = "show"
 
             if not output_dir:
                 if mode == "web":
                     # Web mode uses a temporary server-side directory and then streams the file to browser.
                     output_dir = str(runtime.web_download_dir)
                 else:
-                    output_dir = runtime.get_settings().get("outputDir") or str((Path.cwd() / "downloads").resolve())
+                    output_dir = _resolve_library_output_dir(runtime.get_settings(), content_type)
 
             os.makedirs(output_dir, exist_ok=True)
             ok, message = _run_download(

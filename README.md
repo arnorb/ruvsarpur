@@ -62,6 +62,57 @@ pip install -r requirements.txt
 > [!IMPORTANT]  
 > This tool relies on the **ffmpeg video processing kit**. The previously bundled ffmpeg executable for windows was removed in version 14.2.0. You now must therefore download the [binary executable of ffmpeg](https://www.ffmpeg.org/download.html) or [https://www.gyan.dev/ffmpeg/builds/](https://www.gyan.dev/ffmpeg/builds/) that is appropriate for your operating system from the official website. Then either add the ffmpeg tool to your PATH environment variable or in a `bin/` folder next to the script or alternatively specify its path explicitly using the `--ffmpeg` command line parameter. This was necessary as the latest ffmpeg (v8.0) release is simply too big.
 
+# Docker / TrueNAS
+This repository now includes a Docker setup for running the Python API/downloader and web UI together.
+
+## Quick start
+From the project root:
+
+```bash
+mkdir -p data
+docker compose up -d --build
+```
+
+Open the UI at:
+
+- `http://<your-truenas-ip>:8080`
+
+## What is running
+- `ruvsarpur-api` (Python backend on internal port `8000`)
+- `ruvsarpur-web` (Nginx + frontend on external port `8080`)
+
+The web container proxies `/api/*` calls to the API container internally, so there is no browser CORS or cross-host setup needed.
+
+## Persistent data
+All persistent files are stored in `./data` (mapped to `/data` in the API container):
+
+- GUI settings JSON
+- Downloaded media in `/data/downloads`
+- Temporary web-download files
+
+On TrueNAS, map `./data` to a dataset path if you are importing this compose file into an app stack.
+
+## Category-based library folders (TrueNAS-friendly)
+The UI Settings dialog supports a single library root plus category subfolders:
+
+- **Library root folder**
+- **Shows subfolder**
+- **Movies subfolder**
+- **Sports subfolder**
+
+Example:
+
+- Root: `/data/media/ruv`
+- Shows: `shows`
+- Movies: `movies`
+- Sports: `sports`
+
+This writes followed/library downloads into:
+
+- `/data/media/ruv/shows`
+- `/data/media/ruv/movies`
+- `/data/media/ruv/sports`
+
 # Getting started
 After downloading the script can be run by typing in
 ```
