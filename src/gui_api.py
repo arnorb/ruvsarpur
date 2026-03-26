@@ -4,6 +4,7 @@ from __future__ import annotations
 import datetime
 import hashlib
 import json
+import logging
 import os
 import re
 import subprocess
@@ -13,6 +14,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from logging.handlers import RotatingFileHandler
 from mimetypes import guess_type
 from pathlib import Path
 from types import SimpleNamespace
@@ -37,6 +39,10 @@ POSTER_ALLOWED_HOSTS = {
     "d38kdhuogyllre.cloudfront.net",
     "m.media-amazon.com",
 }
+DOWNLOAD_LOG_FILE = "download-events.log"
+DOWNLOAD_LOGGER_NAME = "ruvsarpur.downloads"
+DOWNLOAD_LOG_MAX_BYTES = 5 * 1024 * 1024
+DOWNLOAD_LOG_BACKUP_COUNT = 5
 
 
 def _default_settings() -> dict:
@@ -134,6 +140,8 @@ class ApiRuntime:
         )
         self.settings = self._load_settings()
         self.status = _default_status()
+        self.download_log_file = (self.settings_file.parent / DOWNLOAD_LOG_FILE).resolve()
+        self.download_logger = self._create_download_logger()
         self.web_download_dir = (Path.cwd() / "downloads" / "_web_tmp").resolve()
         self.web_download_dir.mkdir(parents=True, exist_ok=True)
         self.web_download_tokens: dict[str, Path] = {}
@@ -144,6 +152,41 @@ class ApiRuntime:
         self._cleanup_poster_cache()
         self._scheduler_thread = threading.Thread(target=self._scheduler_loop, daemon=True)
         self._scheduler_thread.start()
+
+    def _create_download_logger(self) -> logging.Logger:
+        # Purpose: persist structured download telemetry for audit and troubleshooting.
+        self.download_log_file.parent.mkdir(parents=True, exist_ok=True)
+        logger = logging.getLogger(DOWNLOAD_LOGGER_NAME)
+        logger.setLevel(logging.INFO)
+        logger.propagate = False
+        if not any(
+            isinstance(handler, RotatingFileHandler)
+            and Path(getattr(handler, "baseFilename", "")).resolve() == self.download_log_file
+            for handler in logger.handlers
+        ):
+            file_handler = RotatingFileHandler(
+                filename=self.download_log_file,
+                maxBytes=DOWNLOAD_LOG_MAX_BYTES,
+                backupCount=DOWNLOAD_LOG_BACKUP_COUNT,
+                encoding="utf-8",
+            )
+            file_handler.setFormatter(logging.Formatter("%(message)s"))
+            logger.addHandler(file_handler)
+        return logger
+
+    def log_download_event(self, event: str, status: str, details: dict | None = None) -> None:
+        # Purpose: emit newline-delimited JSON events so external tooling can parse download history.
+        payload = {
+            "timestampUtc": datetime.datetime.utcnow().isoformat() + "Z",
+            "event": str(event),
+            "status": str(status),
+            "details": details or {},
+        }
+        try:
+            self.download_logger.info(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+        except Exception:
+            # Logging should never break request handling.
+            pass
 
     def get_poster_api_path(self, poster_url: str | None) -> str | None:
         normalized_url = self._normalize_poster_url(poster_url)
@@ -370,6 +413,11 @@ class ApiRuntime:
             portable = self.config.portable
 
         if len(watchlist) == 0:
+            self.log_download_event(
+                event="auto_download_run",
+                status="skipped",
+                details={"reason": "empty_watchlist"},
+            )
             self._set_status(isRunning=False, lastRunStatus="ok", lastRunMessage="No followed series to download")
             return
 
@@ -391,12 +439,26 @@ class ApiRuntime:
 
         script_path = Path(__file__).resolve().parent / "ruvsarpur.py"
         first_group = True
+        self.log_download_event(
+            event="auto_download_run",
+            status="attempt",
+            details={"watchlistSize": len(watchlist)},
+        )
         for content_type in ("show", "movie_or_docu", "sport"):
             group_watchlist = grouped_sids.get(content_type, [])
             if len(group_watchlist) == 0:
                 continue
             output_dir = _resolve_library_output_dir(settings_snapshot, content_type)
             os.makedirs(output_dir, exist_ok=True)
+            self.log_download_event(
+                event="auto_download_group",
+                status="attempt",
+                details={
+                    "contentType": content_type,
+                    "sidCount": len(group_watchlist),
+                    "outputDir": output_dir,
+                },
+            )
             command = [
                 sys.executable,
                 str(script_path),
@@ -416,17 +478,41 @@ class ApiRuntime:
 
             proc = subprocess.run(command, capture_output=True, text=True)
             if proc.returncode != 0:
+                self.log_download_event(
+                    event="auto_download_group",
+                    status="failed",
+                    details={
+                        "contentType": content_type,
+                        "sidCount": len(group_watchlist),
+                        "outputDir": output_dir,
+                        "error": proc.stderr.strip() or proc.stdout.strip() or "Auto download failed",
+                    },
+                )
                 self._set_status(
                     isRunning=False,
                     lastRunStatus="error",
                     lastRunMessage=proc.stderr.strip() or proc.stdout.strip() or "Auto download failed",
                 )
                 return
+            self.log_download_event(
+                event="auto_download_group",
+                status="succeeded",
+                details={
+                    "contentType": content_type,
+                    "sidCount": len(group_watchlist),
+                    "outputDir": output_dir,
+                },
+            )
 
         plex_ok, plex_message = self._run_plex_refresh()
         final_msg = "Auto download completed"
         if plex_message:
             final_msg = f"{final_msg}. {plex_message}"
+        self.log_download_event(
+            event="auto_download_run",
+            status="succeeded" if plex_ok or "skipped" in plex_message.lower() else "warning",
+            details={"message": final_msg},
+        )
         self._set_status(
             isRunning=False,
             lastRunStatus="ok" if plex_ok or "skipped" in plex_message.lower() else "warning",
@@ -559,6 +645,16 @@ def _find_latest_downloaded_video(output_dir: str, pid: str) -> Path | None:
 
 def create_handler(config: ApiConfig, runtime: ApiRuntime):
     class Handler(BaseHTTPRequestHandler):
+        def _request_client_ip(self) -> str:
+            forwarded_for = str(self.headers.get("X-Forwarded-For", "")).strip()
+            if len(forwarded_for) > 0:
+                return forwarded_for.split(",")[0].strip()
+            client_ip = self.client_address[0] if self.client_address else ""
+            return str(client_ip or "")
+
+        def _request_user_agent(self) -> str:
+            return str(self.headers.get("User-Agent", "")).strip()
+
         def _read_json_body(self) -> tuple[dict | None, str | None]:
             try:
                 content_length = int(self.headers.get("Content-Length", "0"))
@@ -636,17 +732,43 @@ def create_handler(config: ApiConfig, runtime: ApiRuntime):
             if parsed.path == "/api/download-file":
                 query_params = parse_qs(parsed.query)
                 token = str(query_params.get("token", [""])[0]).strip()
+                request_id = uuid.uuid4().hex
+                runtime.log_download_event(
+                    event="web_download_file",
+                    status="attempt",
+                    details={
+                        "requestId": request_id,
+                        "tokenProvided": len(token) > 0,
+                        "clientIp": self._request_client_ip(),
+                        "userAgent": self._request_user_agent(),
+                    },
+                )
                 if not token:
+                    runtime.log_download_event(
+                        event="web_download_file",
+                        status="failed",
+                        details={"requestId": request_id, "error": "missing_token"},
+                    )
                     _json_response(self, 400, {"error": "Query parameter 'token' is required"})
                     return
                 file_path = runtime.pop_web_download_file(token)
                 if file_path is None or not file_path.exists() or not file_path.is_file():
+                    runtime.log_download_event(
+                        event="web_download_file",
+                        status="failed",
+                        details={"requestId": request_id, "error": "token_expired_or_file_missing"},
+                    )
                     _json_response(self, 404, {"error": "Download token expired or file not found"})
                     return
                 mime_type = guess_type(file_path.name)[0] or "application/octet-stream"
                 try:
                     file_bytes = file_path.read_bytes()
                 except Exception as ex:
+                    runtime.log_download_event(
+                        event="web_download_file",
+                        status="failed",
+                        details={"requestId": request_id, "error": f"read_failed: {ex}"},
+                    )
                     _json_response(self, 500, {"error": f"Could not read download file: {ex}"})
                     return
                 self.send_response(200)
@@ -658,6 +780,15 @@ def create_handler(config: ApiConfig, runtime: ApiRuntime):
                 self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
                 self.end_headers()
                 self.wfile.write(file_bytes)
+                runtime.log_download_event(
+                    event="web_download_file",
+                    status="succeeded",
+                    details={
+                        "requestId": request_id,
+                        "fileName": file_path.name,
+                        "bytes": len(file_bytes),
+                    },
+                )
                 return
 
             _json_response(self, 404, {"error": "Not found"})
@@ -701,6 +832,15 @@ def create_handler(config: ApiConfig, runtime: ApiRuntime):
 
             body, error = self._read_json_body()
             if error:
+                runtime.log_download_event(
+                    event="download_request",
+                    status="failed",
+                    details={
+                        "error": error,
+                        "clientIp": self._request_client_ip(),
+                        "userAgent": self._request_user_agent(),
+                    },
+                )
                 _json_response(self, 400, {"error": error})
                 return
 
@@ -708,10 +848,34 @@ def create_handler(config: ApiConfig, runtime: ApiRuntime):
             output_dir = str((body or {}).get("outputDir", "")).strip()
             mode = str((body or {}).get("mode", "library")).strip().lower()
             content_type = str((body or {}).get("contentType", "show")).strip().lower()
+            request_id = uuid.uuid4().hex
+            runtime.log_download_event(
+                event="download_request",
+                status="attempt",
+                details={
+                    "requestId": request_id,
+                    "pid": pid,
+                    "mode": mode,
+                    "contentType": content_type,
+                    "outputDirRequested": output_dir,
+                    "clientIp": self._request_client_ip(),
+                    "userAgent": self._request_user_agent(),
+                },
+            )
             if not pid:
+                runtime.log_download_event(
+                    event="download_request",
+                    status="failed",
+                    details={"requestId": request_id, "error": "missing_pid"},
+                )
                 _json_response(self, 400, {"error": "Field 'pid' is required"})
                 return
             if mode not in {"web", "library"}:
+                runtime.log_download_event(
+                    event="download_request",
+                    status="failed",
+                    details={"requestId": request_id, "error": "invalid_mode"},
+                )
                 _json_response(self, 400, {"error": "Field 'mode' must be 'web' or 'library'"})
                 return
             if content_type not in {"show", "movie_or_docu", "sport"}:
@@ -732,6 +896,17 @@ def create_handler(config: ApiConfig, runtime: ApiRuntime):
                 mode=mode,
             )
             if not ok:
+                runtime.log_download_event(
+                    event="download_request",
+                    status="failed",
+                    details={
+                        "requestId": request_id,
+                        "pid": pid,
+                        "mode": mode,
+                        "outputDir": output_dir,
+                        "error": message,
+                    },
+                )
                 _json_response(self, 500, {"error": message})
                 return
 
@@ -739,11 +914,44 @@ def create_handler(config: ApiConfig, runtime: ApiRuntime):
             if mode == "web":
                 downloaded_file = _find_latest_downloaded_video(output_dir=output_dir, pid=pid)
                 if downloaded_file is None:
+                    runtime.log_download_event(
+                        event="download_request",
+                        status="failed",
+                        details={
+                            "requestId": request_id,
+                            "pid": pid,
+                            "mode": mode,
+                            "outputDir": output_dir,
+                            "error": "web_download_completed_but_file_missing",
+                        },
+                    )
                     _json_response(self, 500, {"error": "Web download completed but no local video file was found"})
                     return
                 token = runtime.register_web_download_file(downloaded_file)
                 payload["downloadUrl"] = f"/api/download-file?token={token}"
                 payload["fileName"] = downloaded_file.name
+                runtime.log_download_event(
+                    event="download_request",
+                    status="succeeded",
+                    details={
+                        "requestId": request_id,
+                        "pid": pid,
+                        "mode": mode,
+                        "outputDir": output_dir,
+                        "fileName": downloaded_file.name,
+                    },
+                )
+            else:
+                runtime.log_download_event(
+                    event="download_request",
+                    status="succeeded",
+                    details={
+                        "requestId": request_id,
+                        "pid": pid,
+                        "mode": mode,
+                        "outputDir": output_dir,
+                    },
+                )
             _json_response(self, 200, payload)
 
         def do_DELETE(self) -> None:  # noqa: N802
