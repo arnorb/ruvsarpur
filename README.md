@@ -8,7 +8,7 @@
 > 
 [`ruvsarpur.py`](#ruvsarpurpy) is a python script that allows you to list, search and download TV shows off the Icelandic RÚV Sarpurinn website. The script is operated solely through a windows or linux command prompt.
 
-[`webvtttosrt.py`](#webvtttosrtpy) is a python script that can convert webvtt and vtt files to the .srt subtitles format. (This format is used by the RÚV website for some episodes).
+[`webvtttosrt.py`](#webvtttosrtpy) is a python script that can convert webvtt and vtt files to the .srt subtitles format. (This format is used by the RÚV website for some episodes). The downloader now also auto-converts downloaded `.vtt` subtitles to `.srt`.
 
 Project website at https://sverrirs.github.io/ruvsarpur/
 

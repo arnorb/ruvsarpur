@@ -104,6 +104,7 @@ RE_VOD_URL_PARTS = re.compile(r'(?P<urlprefix>.*)(?P<rest>\/\d{3,4}\/index\.m3u8
 #   https://ruv-vod.akamaized.net/lokad/5240696T0/5240696T0.m3u8
 # resulting in vodbase being = https://ruv-vod.akamaized.net/lokad/5240696T0
 RE_VOD_BASE_URL = re.compile(r'(?P<vodbase>.*)\/(?P<rest>.*\.m3u8)', re.IGNORECASE)
+RE_SUBTITLE_TIMECODE = re.compile(r'(?P<start>(?:\d{2}:)?\d{2}:\d{2}\.\d{3})\s*-->\s*(?P<end>(?:\d{2}:)?\d{2}:\d{2}\.\d{3})')
 
 RUV_URL = 'https://ruv-vod.akamaized.net'
 
@@ -357,7 +358,88 @@ def downloadSubtitlesFiles(subtitles, local_video_filename, video_display_title,
 
     # See naming guidelines https://support.plex.tv/articles/200471133-adding-local-subtitles-to-your-media/
     subtitle_filename = "{0}.{1}.vtt".format( local_video_filename.split(".mp4")[0], subtitle['name'])
-    download_file(subtitle['value'], subtitle_filename, "{1}: Subtitles for: {0}".format(Path(local_video_filename).stem, subtitle['name']))
+    downloaded_subtitle_filename = download_file(subtitle['value'], subtitle_filename, "{1}: Subtitles for: {0}".format(Path(local_video_filename).stem, subtitle['name']))
+    if downloaded_subtitle_filename is not None:
+      convertVttSubtitleFileToSrt(downloaded_subtitle_filename)
+
+def formatSrtTimestamp(value):
+  # WEBVTT may omit hours for short cues, while SRT expects hh:mm:ss,mmm.
+  normalized = value.strip()
+  if normalized.count(":") == 1:
+    normalized = f"00:{normalized}"
+  return normalized.replace('.', ',')
+
+def convertVttSubtitleFileToSrt(vtt_filename):
+  if vtt_filename is None or not str(vtt_filename).lower().endswith('.vtt'):
+    return None
+
+  srt_filename = f"{vtt_filename[:-4]}.srt"
+
+  try:
+    with open(vtt_filename, 'r', encoding='utf-8') as infile:
+      vtt_lines = infile.read().splitlines()
+  except Exception as ex:
+    print(color_warn(f"Warning: Could not read subtitle file '{vtt_filename}' for conversion, {ex}"))
+    return None
+
+  srt_entries = []
+  current_timecode = None
+  current_text_lines = []
+  skip_metadata_block = False
+
+  for raw_line in vtt_lines:
+    clean_line = raw_line.replace('\ufeff', '')
+    stripped_line = clean_line.strip()
+
+    if skip_metadata_block:
+      if stripped_line == "":
+        skip_metadata_block = False
+      continue
+
+    if stripped_line == "":
+      if current_timecode is not None:
+        srt_entries.append((current_timecode, current_text_lines))
+      current_timecode = None
+      current_text_lines = []
+      continue
+
+    if stripped_line.upper() == "WEBVTT":
+      continue
+
+    if stripped_line.startswith("NOTE") or stripped_line == "STYLE" or stripped_line == "REGION":
+      skip_metadata_block = True
+      continue
+
+    timecode_match = RE_SUBTITLE_TIMECODE.match(stripped_line)
+    if timecode_match is not None:
+      start_value = formatSrtTimestamp(timecode_match.group('start'))
+      end_value = formatSrtTimestamp(timecode_match.group('end'))
+      current_timecode = f"{start_value} --> {end_value}"
+      continue
+
+    if current_timecode is None:
+      # Ignore cue identifiers and unsupported VTT directives.
+      continue
+
+    current_text_lines.append(clean_line)
+
+  if current_timecode is not None:
+    srt_entries.append((current_timecode, current_text_lines))
+
+  if len(srt_entries) <= 0:
+    print(color_warn(f"Warning: No subtitle cues found while converting '{vtt_filename}' to SRT"))
+    return None
+
+  with open(srt_filename, 'w+', encoding='utf-8') as out_file:
+    for index, (timecode, text_lines) in enumerate(srt_entries, start=1):
+      out_file.write(f"{index}\n")
+      out_file.write(f"{timecode}\n")
+      for line in text_lines:
+        out_file.write(f"{line}\n")
+      out_file.write('\n')
+
+  print(f"Converted subtitles to SRT: {ntpath.basename(srt_filename)}")
+  return srt_filename
 
 # Downloads a file using Requests
 # From: http://stackoverflow.com/a/16696317
