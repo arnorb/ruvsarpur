@@ -7,6 +7,8 @@ import json
 import logging
 import os
 import re
+import signal
+import shutil
 import subprocess
 import sys
 import threading
@@ -145,6 +147,14 @@ class ApiRuntime:
         self.web_download_dir = (Path.cwd() / "downloads" / "_web_tmp").resolve()
         self.web_download_dir.mkdir(parents=True, exist_ok=True)
         self.web_download_tokens: dict[str, Path] = {}
+        self.download_jobs: dict[str, dict] = {}
+        self.download_job_order: list[str] = []
+        self._download_condition = threading.Condition(self._lock)
+        self._active_download_process: subprocess.Popen | None = None
+        self.refresh_status = {
+            "id": None, "status": "idle", "progress": 0, "completed": 0,
+            "total": 0, "stage": "Idle", "message": "", "finishedAt": None,
+        }
         self.poster_cache_dir = (self.settings_file.parent / "poster-cache").resolve()
         self.poster_cache_dir.mkdir(parents=True, exist_ok=True)
         self._last_poster_cleanup_unix = 0.0
@@ -152,6 +162,225 @@ class ApiRuntime:
         self._cleanup_poster_cache()
         self._scheduler_thread = threading.Thread(target=self._scheduler_loop, daemon=True)
         self._scheduler_thread.start()
+        self._download_worker_thread = threading.Thread(target=self._download_worker, daemon=True)
+        self._download_worker_thread.start()
+
+    def get_refresh_status(self) -> dict:
+        with self._lock:
+            return dict(self.refresh_status)
+
+    def start_schedule_refresh(self) -> dict | None:
+        with self._lock:
+            if self.refresh_status["status"] == "running":
+                return None
+            refresh_id = uuid.uuid4().hex
+            self.refresh_status = {
+                "id": refresh_id, "status": "running", "progress": 0,
+                "completed": 0, "total": 0, "stage": "Connecting to RÚV",
+                "message": "Starting refresh...", "finishedAt": None,
+            }
+        threading.Thread(target=self._run_schedule_refresh, args=(refresh_id,), daemon=True).start()
+        return self.get_refresh_status()
+
+    def _run_schedule_refresh(self, refresh_id: str) -> None:
+        def report(completed: int, total: int, stage: str) -> None:
+            progress = int(round((completed / total) * 100)) if total > 0 else 0
+            with self._lock:
+                if self.refresh_status["id"] != refresh_id:
+                    return
+                self.refresh_status.update(
+                    progress=max(0, min(99, progress)), completed=completed,
+                    total=total, stage=stage,
+                    message=f"{completed} of {total} programmes" if total else stage,
+                )
+        try:
+            _load_schedule(refresh=True, portable=self.config.portable, progress_callback=report)
+            with self._lock:
+                self.refresh_status.update(
+                    status="completed", progress=100, stage="Completed",
+                    message=f"Refreshed {self.refresh_status['total']} programmes",
+                    finishedAt=datetime.datetime.utcnow().isoformat() + "Z",
+                )
+        except Exception as ex:
+            with self._lock:
+                self.refresh_status.update(
+                    status="failed", stage="Failed", message=str(ex),
+                    finishedAt=datetime.datetime.utcnow().isoformat() + "Z",
+                )
+
+    def enqueue_download(
+        self,
+        pid: str,
+        title: str,
+        output_dir: str,
+        mode: str,
+        content_type: str,
+        subtitle_languages: list[str] | None,
+    ) -> dict:
+        job_id = uuid.uuid4().hex
+        job = {
+            "id": job_id,
+            "pid": pid,
+            "title": title or pid,
+            "outputDir": output_dir,
+            "mode": mode,
+            "contentType": content_type,
+            "subtitleLanguages": subtitle_languages,
+            "status": "queued",
+            "progress": 0,
+            "stage": "Waiting in queue",
+            "message": "Queued",
+            "createdAt": datetime.datetime.utcnow().isoformat() + "Z",
+            "startedAt": None,
+            "finishedAt": None,
+            "files": [],
+            "cancelRequested": False,
+        }
+        with self._download_condition:
+            self.download_jobs[job_id] = job
+            self.download_job_order.append(job_id)
+            self._download_condition.notify()
+        return self._public_download_job(job)
+
+    def get_download_jobs(self) -> list[dict]:
+        with self._lock:
+            return [self._public_download_job(self.download_jobs[job_id]) for job_id in reversed(self.download_job_order)]
+
+    def cancel_download_job(self, job_id: str) -> dict | None:
+        process = None
+        with self._download_condition:
+            job = self.download_jobs.get(job_id)
+            if job is None:
+                return None
+            if job["status"] in {"completed", "failed", "cancelled"}:
+                return self._public_download_job(job)
+            job["cancelRequested"] = True
+            if job["status"] == "queued":
+                job.update(status="cancelled", progress=0, stage="Cancelled", message="Cancelled", finishedAt=datetime.datetime.utcnow().isoformat() + "Z")
+            else:
+                job.update(stage="Stopping", message="Stopping download...")
+                process = self._active_download_process
+            public_job = self._public_download_job(job)
+            self._download_condition.notify_all()
+        if process is not None and process.poll() is None:
+            self._terminate_download_process(process)
+        return public_job
+
+    def clear_finished_download_jobs(self) -> int:
+        """Remove finished queue entries without touching downloaded files."""
+        finished_statuses = {"completed", "failed", "cancelled"}
+        with self._download_condition:
+            finished_ids = [
+                job_id
+                for job_id in self.download_job_order
+                if self.download_jobs.get(job_id, {}).get("status") in finished_statuses
+            ]
+            if not finished_ids:
+                return 0
+            finished_id_set = set(finished_ids)
+            self.download_job_order = [
+                job_id for job_id in self.download_job_order if job_id not in finished_id_set
+            ]
+            for job_id in finished_ids:
+                self.download_jobs.pop(job_id, None)
+            return len(finished_ids)
+
+    def retry_download_job(self, job_id: str) -> dict | None:
+        with self._lock:
+            previous = self.download_jobs.get(job_id)
+            if previous is None or previous.get("status") not in {"failed", "cancelled"}:
+                return None
+            retry_details = {
+                "pid": previous["pid"], "title": previous["title"],
+                "output_dir": previous["outputDir"], "mode": previous["mode"],
+                "content_type": previous["contentType"],
+                "subtitle_languages": previous.get("subtitleLanguages"),
+            }
+        return self.enqueue_download(**retry_details)
+
+    @staticmethod
+    def _public_download_job(job: dict) -> dict:
+        return {key: value for key, value in job.items() if key != "cancelRequested"}
+
+    @staticmethod
+    def _terminate_download_process(process: subprocess.Popen) -> None:
+        try:
+            if os.name == "nt":
+                subprocess.run(["taskkill", "/PID", str(process.pid), "/T", "/F"], capture_output=True)
+            else:
+                os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+        except Exception:
+            try:
+                process.terminate()
+            except Exception:
+                pass
+
+    def _download_worker(self) -> None:
+        while True:
+            with self._download_condition:
+                job = next((self.download_jobs[job_id] for job_id in self.download_job_order if self.download_jobs[job_id]["status"] == "queued"), None)
+                if job is None:
+                    self._download_condition.wait(timeout=2)
+                    continue
+                job.update(status="downloading", progress=1, stage="Starting", message="Starting download...", startedAt=datetime.datetime.utcnow().isoformat() + "Z")
+            self._execute_download_job(job)
+
+    def _execute_download_job(self, job: dict) -> None:
+        command = _build_download_command(job["pid"], job["outputDir"], self.config.portable, job["mode"], job["subtitleLanguages"])
+        environment = os.environ.copy()
+        environment["RUVSARPUR_PROGRESS_JSON"] = "1"
+        popen_kwargs = {
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.STDOUT,
+            "text": True,
+            "bufsize": 1,
+            "env": environment,
+        }
+        if os.name != "nt":
+            popen_kwargs["start_new_session"] = True
+        output_tail: list[str] = []
+        try:
+            process = subprocess.Popen(command, **popen_kwargs)
+            with self._lock:
+                self._active_download_process = process
+            for raw_line in iter(process.stdout.readline, "") if process.stdout else []:
+                line = raw_line.strip()
+                if line.startswith("RUVSARPUR_PROGRESS:"):
+                    try:
+                        progress = json.loads(line.split(":", 1)[1])
+                        with self._lock:
+                            job["progress"] = max(0, min(99, int(round(float(progress.get("percent", 0))))))
+                            job["stage"] = str(progress.get("prefix") or "Downloading").strip(" :")
+                            job["message"] = str(progress.get("suffix") or job["stage"])
+                    except Exception:
+                        pass
+                elif line:
+                    output_tail = (output_tail + [line])[-8:]
+            return_code = process.wait()
+            with self._lock:
+                self._active_download_process = None
+                if job["cancelRequested"]:
+                    job.update(status="cancelled", stage="Cancelled", message="Cancelled", finishedAt=datetime.datetime.utcnow().isoformat() + "Z")
+                    return
+            if return_code != 0:
+                raise RuntimeError(output_tail[-1] if output_tail else "Download failed")
+            files = []
+            if job["mode"] == "web":
+                downloaded_files = _find_download_files(job["outputDir"], job["pid"])
+                if not downloaded_files:
+                    raise RuntimeError("Download completed but no local video file was found")
+                for downloaded_file in downloaded_files:
+                    token = self.register_web_download_file(downloaded_file)
+                    files.append({"downloadUrl": f"/api/download-file?token={token}", "fileName": downloaded_file.name, "kind": "video" if downloaded_file == downloaded_files[0] else "subtitle"})
+            with self._lock:
+                job.update(status="completed", progress=100, stage="Completed", message="Download completed", files=files, finishedAt=datetime.datetime.utcnow().isoformat() + "Z")
+        except Exception as ex:
+            with self._lock:
+                self._active_download_process = None
+                if job["cancelRequested"]:
+                    job.update(status="cancelled", stage="Cancelled", message="Cancelled", finishedAt=datetime.datetime.utcnow().isoformat() + "Z")
+                else:
+                    job.update(status="failed", stage="Failed", message=str(ex), finishedAt=datetime.datetime.utcnow().isoformat() + "Z")
 
     def _create_download_logger(self) -> logging.Logger:
         # Purpose: persist structured download telemetry for audit and troubleshooting.
@@ -520,7 +749,7 @@ class ApiRuntime:
         )
 
 
-def _load_schedule(refresh: bool, portable: bool) -> dict:
+def _load_schedule(refresh: bool, portable: bool, progress_callback=None) -> dict:
     today = datetime.date.today()
     tv_schedule_file_name = ruvsarpur.createFullConfigFileName(portable, ruvsarpur.TV_SCHEDULE_LOG_FILE)
     imdb_cache_file_name = ruvsarpur.createFullConfigFileName(portable, ruvsarpur.IMDB_CACHE_FILE)
@@ -530,7 +759,7 @@ def _load_schedule(refresh: bool, portable: bool) -> dict:
     if schedule is None or refresh:
         if schedule is None or schedule["date"].date() < today:
             schedule = {}
-        schedule = ruvsarpur.getVodSchedule(schedule, len(schedule) > 0, imdb_cache, None)
+        schedule = ruvsarpur.getVodSchedule(schedule, len(schedule) > 0, imdb_cache, None, progress_callback)
         if len(schedule) > 1:
             ruvsarpur.saveCurrentTvSchedule(schedule, tv_schedule_file_name)
         if len(imdb_cache) > 0:
@@ -551,9 +780,17 @@ def _search_schedule(
         find=query if query and len(query.strip()) > 0 else None,
         originaltitle=False,
         new=False,
-        includeenglishsubs=False,
+        # English-subtitled RÚV entries are separate programme records. Return
+        # them to the GUI so the user can explicitly choose them.
+        includeenglishsubs=True,
     )
     items = ruvsarpur.searchForItemsInTvSchedule(args, schedule)
+    runtime_config = getattr(runtime, "config", None)
+    if runtime_config is None:
+        previously_recorded = set()
+    else:
+        recorded_file = ruvsarpur.createFullConfigFileName(bool(runtime_config.portable), ruvsarpur.PREV_LOG_FILE)
+        previously_recorded = set(ruvsarpur.getPreviouslyRecordedShows(recorded_file))
     items = sorted(items, key=lambda item: item.get("showtime", ""), reverse=True)
     results = []
     for item in items:
@@ -574,6 +811,22 @@ def _search_schedule(
         )
         series_description = item.get("series_sdesc") or item.get("series_desc")
         episode_description = item.get("desc")
+        subtitle_languages = sorted(
+            {
+                str(subtitle.get("name", "")).strip().lower()
+                for subtitle in (item.get("subtitles") or [])
+                if isinstance(subtitle, dict) and str(subtitle.get("name", "")).strip()
+            }
+        )
+        episode_metadata = item.get("episode") if isinstance(item.get("episode"), dict) else {}
+        vodmp4_metadata = (
+            episode_metadata.get("files", {}).get("vodmp4", {})
+            if isinstance(episode_metadata.get("files"), dict)
+            else {}
+        )
+        expires_at = str(vodmp4_metadata.get("expires") or episode_metadata.get("file_expires") or "").strip()
+        if expires_at.startswith("9999-"):
+            expires_at = ""
         results.append(
             {
                 "pid": str(item.get("pid", "")),
@@ -585,17 +838,31 @@ def _search_schedule(
                 "episodeDescription": episode_description,
                 "seriesDescription": series_description,
                 "publishedAt": item.get("showtime"),
+                "durationSeconds": int(item.get("duration") or 0),
+                "durationLabel": str(item.get("duration_friendly") or "").strip() or None,
+                "firstAppearedAt": episode_metadata.get("firstrun") or item.get("showtime"),
+                "expiresAt": expires_at or None,
                 "webUrl": web_url,
                 # Purpose: route poster images through short-lived local cache for faster UI loads.
                 "posterUrl": resolved_poster_url,
                 "isFollowed": str(item.get("sid", "")) in watchlist_sids,
+                "isDownloaded": pid in previously_recorded,
                 "contentType": content_type,
+                "categories": [str(category) for category in (item.get("categories") or []) if category],
+                "subtitleLanguages": subtitle_languages,
+                "englishSubtitledVersion": bool(item.get("english_subtitled")),
             }
         )
     return results
 
 
-def _run_download(pid: str, output_dir: str, portable: bool, mode: str) -> tuple[bool, str]:
+def _build_download_command(
+    pid: str,
+    output_dir: str,
+    portable: bool,
+    mode: str,
+    subtitle_languages: list[str] | None = None,
+) -> list[str]:
     script_path = Path(__file__).resolve().parent / "ruvsarpur.py"
     command = [
         sys.executable,
@@ -613,6 +880,20 @@ def _run_download(pid: str, output_dir: str, portable: bool, mode: str) -> tuple
         command.append("--force")
     if portable:
         command.append("--portable")
+    if subtitle_languages is not None:
+        command.append("--subtitlelanguages")
+        command.extend(subtitle_languages if subtitle_languages else ["none"])
+    return command
+
+
+def _run_download(
+    pid: str,
+    output_dir: str,
+    portable: bool,
+    mode: str,
+    subtitle_languages: list[str] | None = None,
+) -> tuple[bool, str]:
+    command = _build_download_command(pid, output_dir, portable, mode, subtitle_languages)
     proc = subprocess.run(command, capture_output=True, text=True)
     if proc.returncode != 0:
         return False, proc.stderr.strip() or proc.stdout.strip() or "Download failed"
@@ -641,6 +922,33 @@ def _find_latest_downloaded_video(output_dir: str, pid: str) -> Path | None:
     if len(candidates) == 0:
         return None
     return max(candidates, key=lambda item: item.stat().st_mtime)
+
+
+def _find_download_files(output_dir: str, pid: str) -> list[Path]:
+    video_file = _find_latest_downloaded_video(output_dir=output_dir, pid=pid)
+    if video_file is None:
+        return []
+
+    files = [video_file]
+    subtitle_directory = video_file.parent
+    subtitle_prefix = f"{video_file.stem}."
+    srt_languages: set[str] = set()
+    sidecar_files = sorted(
+        candidate
+        for candidate in subtitle_directory.iterdir()
+        if candidate.is_file() and candidate.name.startswith(subtitle_prefix)
+    )
+    for subtitle_file in sidecar_files:
+        if subtitle_file.suffix.lower() == ".srt":
+            files.append(subtitle_file)
+            srt_languages.add(subtitle_file.stem.rsplit(".", 1)[-1].lower())
+    for subtitle_file in sidecar_files:
+        if subtitle_file.suffix.lower() != ".vtt":
+            continue
+        language = subtitle_file.stem.rsplit(".", 1)[-1].lower()
+        if language not in srt_languages:
+            files.append(subtitle_file)
+    return files
 
 
 def create_handler(config: ApiConfig, runtime: ApiRuntime):
@@ -729,6 +1037,14 @@ def create_handler(config: ApiConfig, runtime: ApiRuntime):
                 _json_response(self, 200, {"status": runtime.get_status()})
                 return
 
+            if parsed.path == "/api/download/jobs":
+                _json_response(self, 200, {"jobs": runtime.get_download_jobs()})
+                return
+
+            if parsed.path == "/api/refresh/status":
+                _json_response(self, 200, {"status": runtime.get_refresh_status()})
+                return
+
             if parsed.path == "/api/download-file":
                 query_params = parse_qs(parsed.query)
                 token = str(query_params.get("token", [""])[0]).strip()
@@ -762,7 +1078,7 @@ def create_handler(config: ApiConfig, runtime: ApiRuntime):
                     return
                 mime_type = guess_type(file_path.name)[0] or "application/octet-stream"
                 try:
-                    file_bytes = file_path.read_bytes()
+                    file_size = file_path.stat().st_size
                 except Exception as ex:
                     runtime.log_download_event(
                         event="web_download_file",
@@ -773,20 +1089,29 @@ def create_handler(config: ApiConfig, runtime: ApiRuntime):
                     return
                 self.send_response(200)
                 self.send_header("Content-Type", mime_type)
-                self.send_header("Content-Length", str(len(file_bytes)))
+                self.send_header("Content-Length", str(file_size))
                 self.send_header("Content-Disposition", f'attachment; filename="{file_path.name}"')
                 self.send_header("Access-Control-Allow-Origin", "*")
                 self.send_header("Access-Control-Allow-Headers", "Content-Type")
                 self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
                 self.end_headers()
-                self.wfile.write(file_bytes)
+                try:
+                    with file_path.open("rb") as source:
+                        shutil.copyfileobj(source, self.wfile, length=1024 * 1024)
+                except (BrokenPipeError, ConnectionResetError):
+                    runtime.log_download_event(
+                        event="web_download_file",
+                        status="cancelled",
+                        details={"requestId": request_id, "fileName": file_path.name},
+                    )
+                    return
                 runtime.log_download_event(
                     event="web_download_file",
                     status="succeeded",
                     details={
                         "requestId": request_id,
                         "fileName": file_path.name,
-                        "bytes": len(file_bytes),
+                        "bytes": file_size,
                     },
                 )
                 return
@@ -826,6 +1151,31 @@ def create_handler(config: ApiConfig, runtime: ApiRuntime):
                 _json_response(self, 200, {"ok": True, "message": "Auto download started"})
                 return
 
+            if parsed.path == "/api/refresh":
+                status = runtime.start_schedule_refresh()
+                if status is None:
+                    _json_response(self, 409, {"error": "A refresh is already running", "status": runtime.get_refresh_status()})
+                    return
+                _json_response(self, 202, {"ok": True, "status": status})
+                return
+
+            if parsed.path == "/api/download/jobs/retry":
+                body, error = self._read_json_body()
+                if error:
+                    _json_response(self, 400, {"error": error})
+                    return
+                job_id = str((body or {}).get("jobId", "")).strip()
+                if not job_id:
+                    _json_response(self, 400, {"error": "Field 'jobId' is required"})
+                    return
+                job = runtime.retry_download_job(job_id)
+                if job is None:
+                    _json_response(self, 409, {"error": "Only failed or cancelled downloads can be retried"})
+                    return
+                runtime.log_download_event(event="download_retry", status="queued", details={"previousJobId": job_id, "jobId": job["id"], "pid": job["pid"]})
+                _json_response(self, 202, {"ok": True, "message": "Added retry to download queue", "job": job})
+                return
+
             if parsed.path != "/api/download":
                 _json_response(self, 404, {"error": "Not found"})
                 return
@@ -845,9 +1195,24 @@ def create_handler(config: ApiConfig, runtime: ApiRuntime):
                 return
 
             pid = str((body or {}).get("pid", "")).strip()
+            title = str((body or {}).get("title", "")).strip()
             output_dir = str((body or {}).get("outputDir", "")).strip()
             mode = str((body or {}).get("mode", "library")).strip().lower()
             content_type = str((body or {}).get("contentType", "show")).strip().lower()
+            requested_subtitle_languages = (body or {}).get("subtitleLanguages")
+            subtitle_languages: list[str] | None = None
+            if requested_subtitle_languages is not None:
+                if not isinstance(requested_subtitle_languages, list):
+                    _json_response(self, 400, {"error": "Field 'subtitleLanguages' must be a list"})
+                    return
+                subtitle_languages = []
+                for language in requested_subtitle_languages:
+                    normalized_language = str(language).strip().lower()
+                    if normalized_language not in {"is", "en"}:
+                        _json_response(self, 400, {"error": "Unsupported subtitle language"})
+                        return
+                    if normalized_language not in subtitle_languages:
+                        subtitle_languages.append(normalized_language)
             request_id = uuid.uuid4().hex
             runtime.log_download_event(
                 event="download_request",
@@ -889,73 +1254,35 @@ def create_handler(config: ApiConfig, runtime: ApiRuntime):
                     output_dir = _resolve_library_output_dir(runtime.get_settings(), content_type)
 
             os.makedirs(output_dir, exist_ok=True)
-            ok, message = _run_download(
+            job = runtime.enqueue_download(
                 pid=pid,
+                title=title,
                 output_dir=output_dir,
-                portable=config.portable,
                 mode=mode,
+                content_type=content_type,
+                subtitle_languages=subtitle_languages,
             )
-            if not ok:
-                runtime.log_download_event(
-                    event="download_request",
-                    status="failed",
-                    details={
-                        "requestId": request_id,
-                        "pid": pid,
-                        "mode": mode,
-                        "outputDir": output_dir,
-                        "error": message,
-                    },
-                )
-                _json_response(self, 500, {"error": message})
-                return
-
-            payload = {"ok": True, "message": message, "outputDir": output_dir, "pid": pid, "mode": mode}
-            if mode == "web":
-                downloaded_file = _find_latest_downloaded_video(output_dir=output_dir, pid=pid)
-                if downloaded_file is None:
-                    runtime.log_download_event(
-                        event="download_request",
-                        status="failed",
-                        details={
-                            "requestId": request_id,
-                            "pid": pid,
-                            "mode": mode,
-                            "outputDir": output_dir,
-                            "error": "web_download_completed_but_file_missing",
-                        },
-                    )
-                    _json_response(self, 500, {"error": "Web download completed but no local video file was found"})
-                    return
-                token = runtime.register_web_download_file(downloaded_file)
-                payload["downloadUrl"] = f"/api/download-file?token={token}"
-                payload["fileName"] = downloaded_file.name
-                runtime.log_download_event(
-                    event="download_request",
-                    status="succeeded",
-                    details={
-                        "requestId": request_id,
-                        "pid": pid,
-                        "mode": mode,
-                        "outputDir": output_dir,
-                        "fileName": downloaded_file.name,
-                    },
-                )
-            else:
-                runtime.log_download_event(
-                    event="download_request",
-                    status="succeeded",
-                    details={
-                        "requestId": request_id,
-                        "pid": pid,
-                        "mode": mode,
-                        "outputDir": output_dir,
-                    },
-                )
-            _json_response(self, 200, payload)
+            runtime.log_download_event(event="download_request", status="queued", details={"requestId": request_id, "jobId": job["id"], "pid": pid, "mode": mode, "outputDir": output_dir})
+            _json_response(self, 202, {"ok": True, "message": "Added to download queue", "job": job})
 
         def do_DELETE(self) -> None:  # noqa: N802
             parsed = urlparse(self.path)
+            if parsed.path == "/api/download/jobs":
+                query_params = parse_qs(parsed.query)
+                if str(query_params.get("clear", [""])[0]).strip() == "finished":
+                    cleared = runtime.clear_finished_download_jobs()
+                    _json_response(self, 200, {"ok": True, "cleared": cleared})
+                    return
+                job_id = str(query_params.get("jobId", [""])[0]).strip()
+                if not job_id:
+                    _json_response(self, 400, {"error": "Query parameter 'jobId' is required"})
+                    return
+                job = runtime.cancel_download_job(job_id)
+                if job is None:
+                    _json_response(self, 404, {"error": "Download job not found"})
+                    return
+                _json_response(self, 200, {"ok": True, "job": job})
+                return
             if parsed.path != "/api/watchlist":
                 _json_response(self, 404, {"error": "Not found"})
                 return

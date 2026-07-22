@@ -142,6 +142,15 @@ def printProgress (iteration, total, prefix = '', suffix = '', decimals = 1, bar
     """
     formatStr       = "{0:." + str(decimals) + "f}"
     percents        = formatStr.format(100 * (iteration / float(total)))
+    if os.getenv("RUVSARPUR_PROGRESS_JSON") == "1":
+      print("\nRUVSARPUR_PROGRESS:" + json.dumps({
+        "iteration": iteration,
+        "total": total,
+        "percent": float(percents),
+        "prefix": prefix,
+        "suffix": suffix,
+      }), flush=True)
+      return
     filledLength    = int(round(barLength * iteration / float(total)))
     if( color ):
       bar             = color_progress_fill('=' * filledLength) + color_progress_remaining('-' * (barLength - filledLength))
@@ -768,6 +777,9 @@ def parseArguments():
   parser.add_argument("--includeenglishsubs", help="When set the system will also download entries that have burnt in English subtitles available. This is true for some special schedule items. By default this is off.", 
                                              action="store_true")
 
+  parser.add_argument("--subtitlelanguages", help="Only download subtitle tracks in these language codes. Use 'none' to skip subtitle files.",
+                                             type=str, nargs="+", default=None)
+
   parser.add_argument("--ffmpeg",       help="Full path to the ffmpeg executable file", 
                                         type=str)
 
@@ -987,7 +999,7 @@ RE_CAPTURE_VOD_EPNUM_FROM_TITLE = re.compile(r'(?P<ep_num>\d+) af (?P<ep_total>\
 #
 # Downloads the full front page VOD schedule and for each episode in there fetches all available episodes
 # uses the new RUV GraphQL queries
-def getVodSchedule(existing_schedule, args_incremental_refresh=False, imdb_cache=None, imdb_orignal_titles=None):
+def getVodSchedule(existing_schedule, args_incremental_refresh=False, imdb_cache=None, imdb_orignal_titles=None, progress_callback=None):
 
   # Start with getting all the series available on RUV through their API, this gives us basic information about each of the series
   # https://api.ruv.is/api/programs/tv/all
@@ -1031,6 +1043,8 @@ def getVodSchedule(existing_schedule, args_incremental_refresh=False, imdb_cache
 
   completed_programs = 0
   total_programs = len(panels)
+  if progress_callback:
+    progress_callback(completed_programs, total_programs, 'Reading programme list')
   
   print("{0} | Total: {1} series available".format(color_title('Downloading VOD schedule'), total_programs))
   printProgress(completed_programs, total_programs, prefix = 'Reading:', suffix = '', barLength = 25)
@@ -1048,6 +1062,8 @@ def getVodSchedule(existing_schedule, args_incremental_refresh=False, imdb_cache
     if args_incremental_refresh:
       existing_vod_episodes_count = sum(type(schedule[p]) is dict and schedule[p]['sid'] == str(program['id']) for p in schedule)
       if( program['web_available_episodes'] <= existing_vod_episodes_count and existing_vod_episodes_count > 0 ):
+        if progress_callback:
+          progress_callback(completed_programs, total_programs, 'Checking programmes')
         continue
       else:
         existing_vs_new_diff = program['web_available_episodes'] - existing_vod_episodes_count
@@ -1066,6 +1082,8 @@ def getVodSchedule(existing_schedule, args_incremental_refresh=False, imdb_cache
         print(traceback.format_exc())
         continue
     printProgress(completed_programs, total_programs, prefix = 'Reading:', suffix ='', barLength = 25)
+    if progress_callback:
+      progress_callback(completed_programs, total_programs, 'Reading programmes')
 
   return schedule
 
@@ -1725,9 +1743,17 @@ def runMain():
           downloadTVShowPoster(local_filename, display_title, item, Path(args.output))
 
       # Attempt to download any subtitles if available 
-      if not item['subtitles'] is None and len(item['subtitles']) > 0:
+      selected_subtitles = item['subtitles']
+      if args.subtitlelanguages is not None:
+        requested_subtitle_languages = {language.lower() for language in args.subtitlelanguages}
+        selected_subtitles = [] if 'none' in requested_subtitle_languages else [
+          subtitle for subtitle in (item['subtitles'] or [])
+          if str(subtitle.get('name', '')).lower() in requested_subtitle_languages
+        ]
+
+      if selected_subtitles is not None and len(selected_subtitles) > 0:
         try:
-          downloadSubtitlesFiles(item['subtitles'], local_filename, display_title, item)
+          downloadSubtitlesFiles(selected_subtitles, local_filename, display_title, item)
         except Exception as ex:
           print("Error: Could not download subtitle files for item, "+item['title'])
           print(ex)
