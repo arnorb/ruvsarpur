@@ -17,6 +17,25 @@ class DummyRuntime:
 
 
 class GuiApiTests(unittest.TestCase):
+    def test_web_download_jobs_use_separate_temporary_directories(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            runtime = gui_api.ApiRuntime.__new__(gui_api.ApiRuntime)
+            runtime.web_download_dir = Path(temporary_directory)
+            runtime._download_condition = gui_api.threading.Condition(gui_api.threading.RLock())
+            runtime.download_jobs = {}
+            runtime.download_job_order = []
+
+            first = runtime.enqueue_download("normal-pid", "Normal", temporary_directory, "web", "show", ["is"])
+            second = runtime.enqueue_download("english-pid", "English", temporary_directory, "web", "show", [])
+
+            first_dir = Path(runtime.download_jobs[first["id"]]["outputDir"])
+            second_dir = Path(runtime.download_jobs[second["id"]]["outputDir"])
+            self.assertNotEqual(first_dir, second_dir)
+            self.assertEqual(first_dir.parent, Path(temporary_directory))
+            self.assertEqual(second_dir.parent, Path(temporary_directory))
+            self.assertTrue(first_dir.is_dir())
+            self.assertTrue(second_dir.is_dir())
+
     def test_clear_finished_download_jobs_keeps_active_jobs(self):
         runtime = gui_api.ApiRuntime.__new__(gui_api.ApiRuntime)
         runtime._download_condition = gui_api.threading.Condition(gui_api.threading.RLock())

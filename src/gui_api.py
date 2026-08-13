@@ -218,6 +218,14 @@ class ApiRuntime:
         subtitle_languages: list[str] | None,
     ) -> dict:
         job_id = uuid.uuid4().hex
+        if mode == "web":
+            # Browser downloads used to share one temporary directory. Since
+            # many RÚV filenames do not contain their pid, a completed job
+            # could accidentally return the newest file from another job
+            # (notably the normal and burned-in-English variants of a title).
+            # An isolated directory makes the job-to-file mapping unambiguous.
+            output_dir = str(self.web_download_dir / job_id)
+            os.makedirs(output_dir, exist_ok=True)
         job = {
             "id": job_id,
             "pid": pid,
