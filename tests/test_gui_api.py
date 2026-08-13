@@ -114,6 +114,7 @@ class GuiApiTests(unittest.TestCase):
 
         self.assertTrue(ok)
         command = run.call_args.args[0]
+        self.assertIn("--includeenglishsubs", command)
         self.assertEqual(command[command.index("--subtitlelanguages") + 1 :], ["is", "en"])
 
     def test_browser_download_includes_srt_sidecars_without_duplicate_vtt(self):

@@ -376,7 +376,8 @@ class ApiRuntime:
             if job["mode"] == "web":
                 downloaded_files = _find_download_files(job["outputDir"], job["pid"])
                 if not downloaded_files:
-                    raise RuntimeError("Download completed but no local video file was found")
+                    detail = output_tail[-1] if output_tail else "The downloader produced no output."
+                    raise RuntimeError(f"No video file was produced. {detail}")
                 for downloaded_file in downloaded_files:
                     token = self.register_web_download_file(downloaded_file)
                     files.append({"downloadUrl": f"/api/download-file?token={token}", "fileName": downloaded_file.name, "kind": "video" if downloaded_file == downloaded_files[0] else "subtitle"})
@@ -877,6 +878,10 @@ def _build_download_command(
         str(script_path),
         "--pid",
         str(pid),
+        # The GUI catalogue includes RÚV's separate burned-in-English
+        # programme records. Without this switch the CLI finds the pid and
+        # then silently filters that record back out before downloading it.
+        "--includeenglishsubs",
         "--output",
         output_dir,
     ]
