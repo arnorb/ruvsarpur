@@ -74,7 +74,7 @@ const storeDefaultDownloadFolder = async (folder: BrowserDirectoryHandle | null)
 
 declare global {
   interface Window {
-    showDirectoryPicker?: () => Promise<BrowserDirectoryHandle>;
+    showDirectoryPicker?: (options?: { mode?: "read" | "readwrite" }) => Promise<BrowserDirectoryHandle>;
   }
 }
 
@@ -842,7 +842,17 @@ export default function App() {
   const chooseFolderAndDownload = async () => {
     if (!downloadChoice || !window.showDirectoryPicker) return;
     try {
-      const directoryHandle = await window.showDirectoryPicker();
+      // Ask for write access while this button click still counts as a user
+      // action. Waiting until the background download finishes is too late:
+      // Chrome then refuses to prompt for permission.
+      const directoryHandle = await window.showDirectoryPicker({ mode: "readwrite" });
+      let permission = directoryHandle.queryPermission
+        ? await directoryHandle.queryPermission({ mode: "readwrite" })
+        : "granted";
+      if (permission !== "granted" && directoryHandle.requestPermission) {
+        permission = await directoryHandle.requestPermission({ mode: "readwrite" });
+      }
+      if (permission !== "granted") throw new Error("Permission to save in the selected folder was not granted.");
       await handleDownloads(downloadChoice.shows, downloadChoice.mode, directoryHandle);
     } catch (error) {
       if (error instanceof DOMException && error.name === "AbortError") return;
@@ -853,7 +863,14 @@ export default function App() {
   const chooseDefaultDownloadFolder = async () => {
     if (!window.showDirectoryPicker) return;
     try {
-      const directoryHandle = await window.showDirectoryPicker();
+      const directoryHandle = await window.showDirectoryPicker({ mode: "readwrite" });
+      let permission = directoryHandle.queryPermission
+        ? await directoryHandle.queryPermission({ mode: "readwrite" })
+        : "granted";
+      if (permission !== "granted" && directoryHandle.requestPermission) {
+        permission = await directoryHandle.requestPermission({ mode: "readwrite" });
+      }
+      if (permission !== "granted") throw new Error("Permission to save in the selected folder was not granted.");
       await storeDefaultDownloadFolder(directoryHandle);
       setDefaultDownloadFolder(directoryHandle);
       setStatusMessage(`Default download folder set to ${directoryHandle.name}.`);
