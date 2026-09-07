@@ -970,6 +970,25 @@ def createShowTitle(show, include_original_title=False, use_plex_formatting=Fals
     if( 'original-title' in show and not show['original-title'] is None ):
       show_title = "{0} - {1}".format(sanitizeFileName(show['series_title']), rchop(sanitizeFileName(show['original-title']), [' I', ' II', ' III', ' IV', ' V', ' VI', ' VII', ' VIII', ' IX']))
   
+  # RÚV's "(3 af 3)" suffix describes how many episodes are available now,
+  # not necessarily the final series length. Use stable season/episode naming
+  # for episodic programmes so the same episode does not appear to change from
+  # "3 of 3" to "3 of 4" when another episode is published.
+  elif (
+    'ep_num' in show
+    and show.get('ep_num') is not None
+    and not show.get('is_movie')
+    and not show.get('is_docu')
+    and not show.get('is_sport')
+    and (show.get('multiple_episodes') or int(show.get('ep_total') or 0) > 1)
+  ):
+    season = str(show.get('season_num') or 1).zfill(2)
+    episode = str(show['ep_num']).zfill(2)
+    series_title = sanitizeFileName(show.get('series_title') or show['title'])
+    show_title = f"{series_title} s{season}e{episode}"
+    if include_original_title and show.get('original-title'):
+      show_title = f"{show_title} - {sanitizeFileName(show['original-title'])}"
+
   # If not plex then adhere to the original title flag if set
   elif( include_original_title and 'original-title' in show and not show['original-title'] is None ):
     return "{0} - {1}".format(sanitizeFileName(show['title']), sanitizeFileName(show['original-title']))
