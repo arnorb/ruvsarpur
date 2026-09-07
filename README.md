@@ -113,6 +113,17 @@ This writes followed/library downloads into:
 - `/data/media/ruv/movies`
 - `/data/media/ruv/sports`
 
+## Web UI download options
+
+The web UI keeps **Download** and **Library** as separate actions. **Download**
+saves through the browser, either to its normal download folder, a remembered
+default folder (in supported browsers), or a folder selected for that download.
+**Library** uses the configured category folders described above. Both actions
+let you choose subtitle files for each download. Icelandic subtitles are
+selected by default when available; English subtitle files must be selected
+explicitly. RÚV entries whose English subtitles are burned into the video are
+also available and clearly marked as English-subtitled video versions.
+
 # Getting started
 After downloading the script can be run by typing in
 ```
