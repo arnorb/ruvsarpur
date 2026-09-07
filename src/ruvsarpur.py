@@ -518,6 +518,19 @@ def _playlist_quality_variants(master_text, master_url):
   return variants
 
 
+def _playlist_default_audio_url(master_text, master_url):
+  audio_lines = [
+    line.strip() for line in master_text.splitlines()
+    if line.strip().startswith('#EXT-X-MEDIA:TYPE=AUDIO')
+  ]
+  preferred = next((line for line in audio_lines if 'DEFAULT=YES' in line.upper()), None)
+  selected = preferred or (audio_lines[0] if audio_lines else None)
+  if selected is None:
+    return None
+  uri = re.search(r'URI="(?P<uri>[^"]+)"', selected, re.IGNORECASE)
+  return urllib.parse.urljoin(master_url, uri.group('uri')) if uri else None
+
+
 def find_m3u8_playlist_url(item, display_title, video_quality):
   
   # use default headers
@@ -571,6 +584,7 @@ def find_m3u8_playlist_url(item, display_title, video_quality):
     # Read those advertised URLs instead of guessing an old numeric path.
     advertised_variants = _playlist_quality_variants(request.text, url_first_file)
     if advertised_variants:
+      audio_url = _playlist_default_audio_url(request.text, url_first_file)
       for candidate_quality in quality_candidates:
         variant = advertised_variants.get(candidate_quality)
         if variant is None:
@@ -583,7 +597,12 @@ def find_m3u8_playlist_url(item, display_title, video_quality):
         if candidate_quality != video_quality:
           print("Requested quality {0} is unavailable; using {1} instead.".format(video_quality, candidate_quality))
         fragments = [line.strip() for line in stream_request.text.splitlines() if len(line) > 1 and line[0] != '#']
-        return {'url': url_formatted, 'fragments':len(fragments), 'quality':candidate_quality}
+        return {
+          'url': url_formatted,
+          'audio_url': audio_url,
+          'fragments':len(fragments),
+          'quality':candidate_quality,
+        }
       return None
 
     old_format = request.text.find('.m3u8?tlm=hls&streams') > 0
@@ -612,7 +631,7 @@ def find_m3u8_playlist_url(item, display_title, video_quality):
     return None
 
 # FFMPEG download of the playlist
-def download_m3u8_playlist_using_ffmpeg(ffmpegexec, playlist_url, playlist_fragments, local_filename, display_title, keeppartial, video_quality, disable_metadata, videoInfo):
+def download_m3u8_playlist_using_ffmpeg(ffmpegexec, playlist_url, playlist_fragments, local_filename, display_title, keeppartial, video_quality, disable_metadata, videoInfo, audio_url=None):
   prog_args = [ffmpegexec]
 
   # Don't show copyright header
@@ -631,6 +650,13 @@ def download_m3u8_playlist_using_ffmpeg(ffmpegexec, playlist_url, playlist_fragm
   # Add the input url
   prog_args.append('-i')
   prog_args.append(playlist_url)
+
+  # New RÚV HLS renditions contain video only and advertise Icelandic audio as
+  # a separate playlist in the master file. Add and explicitly map both inputs.
+  if audio_url:
+    prog_args.append('-i')
+    prog_args.append(audio_url)
+    prog_args.extend(['-map', '0:v:0', '-map', '1:a:0'])
 
   # conversion configuration
   prog_args.append('-c')
@@ -1782,7 +1808,7 @@ def runMain():
 
         #print(playlist_data
         # Now ask FFMPEG to download and remux all the fragments for us
-        result = download_m3u8_playlist_using_ffmpeg(ffmpegexec, playlist_data['url'], playlist_data['fragments'], local_filename, display_title, args.keeppartial, playlist_data.get('quality', args.quality), args.nometadata, item)
+        result = download_m3u8_playlist_using_ffmpeg(ffmpegexec, playlist_data['url'], playlist_data['fragments'], local_filename, display_title, args.keeppartial, playlist_data.get('quality', args.quality), args.nometadata, item, playlist_data.get('audio_url'))
         if( not result is None ):
           # if everything was OK then save the pid as successfully downloaded
           appendNewPidAndSavePreviouslyRecordedShows(item['pid'], previously_recorded, previously_recorded_file_name) 

@@ -29,6 +29,20 @@ class PlaylistQualityTests(unittest.TestCase):
         self.assertEqual(variants["HD720"]["url"], "https://ruv-vod.akamaized.net/opid/example/720p/stream.m3u8")
         self.assertEqual(variants["Normal"]["url"], "https://ruv-vod.akamaized.net/opid/example/540p/stream.m3u8")
 
+    def test_separate_default_audio_playlist_is_discovered(self):
+        master = """#EXTM3U
+#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aud",NAME="ISL",DEFAULT=YES,URI="ISL/stream.m3u8"
+#EXT-X-STREAM-INF:BANDWIDTH=7207916,RESOLUTION=1920x1080,AUDIO="aud"
+1080p/stream.m3u8
+"""
+
+        audio_url = ruvsarpur._playlist_default_audio_url(
+            master,
+            "https://ruv-vod.akamaized.net/opid/example/example.m3u8",
+        )
+
+        self.assertEqual(audio_url, "https://ruv-vod.akamaized.net/opid/example/ISL/stream.m3u8")
+
 
 if __name__ == "__main__":
     unittest.main()
