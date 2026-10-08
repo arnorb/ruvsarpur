@@ -142,6 +142,15 @@ def printProgress (iteration, total, prefix = '', suffix = '', decimals = 1, bar
     """
     formatStr       = "{0:." + str(decimals) + "f}"
     percents        = formatStr.format(100 * (iteration / float(total)))
+    if os.getenv("RUVSARPUR_PROGRESS_JSON") == "1":
+      print("\nRUVSARPUR_PROGRESS:" + json.dumps({
+        "iteration": iteration,
+        "total": total,
+        "percent": float(percents),
+        "prefix": prefix,
+        "suffix": suffix,
+      }), flush=True)
+      return
     filledLength    = int(round(barLength * iteration / float(total)))
     if( color ):
       bar             = color_progress_fill('=' * filledLength) + color_progress_remaining('-' * (barLength - filledLength))
@@ -487,6 +496,41 @@ def __create_retry_session(retries=5):
   return session
 
 # Attempts to discover the correct playlist file
+def _playlist_quality_variants(master_text, master_url):
+  """Return master-playlist variants keyed by the closest CLI quality name."""
+  variants = {}
+  pending_height = None
+  for raw_line in master_text.splitlines():
+    line = raw_line.strip()
+    if line.startswith('#EXT-X-STREAM-INF:'):
+      resolution = re.search(r'RESOLUTION=\d+x(?P<height>\d+)', line, re.IGNORECASE)
+      pending_height = int(resolution.group('height')) if resolution else None
+    elif pending_height is not None and line and not line.startswith('#'):
+      quality = 'HD1080' if pending_height >= 900 else 'HD720' if pending_height >= 650 else 'Normal'
+      # Keep the largest rendition within each friendly quality band.
+      current = variants.get(quality)
+      if current is None or pending_height > current['height']:
+        variants[quality] = {
+          'url': urllib.parse.urljoin(master_url, line),
+          'height': pending_height,
+        }
+      pending_height = None
+  return variants
+
+
+def _playlist_default_audio_url(master_text, master_url):
+  audio_lines = [
+    line.strip() for line in master_text.splitlines()
+    if line.strip().startswith('#EXT-X-MEDIA:TYPE=AUDIO')
+  ]
+  preferred = next((line for line in audio_lines if 'DEFAULT=YES' in line.upper()), None)
+  selected = preferred or (audio_lines[0] if audio_lines else None)
+  if selected is None:
+    return None
+  uri = re.search(r'URI="(?P<uri>[^"]+)"', selected, re.IGNORECASE)
+  return urllib.parse.urljoin(master_url, uri.group('uri')) if uri else None
+
+
 def find_m3u8_playlist_url(item, display_title, video_quality):
   
   # use default headers
@@ -494,13 +538,26 @@ def find_m3u8_playlist_url(item, display_title, video_quality):
 
   # Store the program id
   pid = item['pid']
+  url_formatted = item.get('vod_url_full')
 
   # June 2022 : New alternate simpler VOD url format
   #    https://ruv-vod.akamaized.net/lokad/5237328T0/3600/index.m3u8
 
-  if not 'vod_url' in item or not 'vod_url_full' in item:
-    print( "{0} is not available through VOD (pid={1})".format(color_title(display_title), pid))
+  if not item.get('vod_url') or not item.get('vod_url_full'):
+    print( "Error: {0} has no on-demand video address from RÚV yet (pid={1}). It may not have been published, may have expired, or may not be available for download.".format(color_title(display_title), pid))
     return None
+
+  # Try the requested quality first, then progressively smaller variants. RÚV
+  # occasionally publishes a programme without every rendition advertised by
+  # the catalogue. A missing 1080p playlist should not prevent a 720p or SD
+  # download from succeeding.
+  quality_order = list(QUALITY_BITRATE.keys())
+  requested_index = quality_order.index(video_quality)
+  quality_candidates = (
+    [video_quality]
+    + list(reversed(quality_order[:requested_index]))
+    + quality_order[requested_index + 1:]
+  )
 
   # Plan
   # 1. Download the file from the vod_url_full and check it's contents
@@ -523,24 +580,49 @@ def find_m3u8_playlist_url(item, display_title, video_quality):
       print( "{0} not found on server (first file, pid={1}, url={2})".format(color_title(display_title), pid, url_first_file))
       return None
 
-    # Assume the new format
-    url_formatted = '{0}/{1}/index.m3u8'.format(item['vod_url'], QUALITY_BITRATE[video_quality]['code']) 
-
-    # Check if this actually is the old format
-    if request.text.find('.m3u8?tlm=hls&streams') > 0:
-      url_formatted = '{0}/asset-audio=50000-video={1}.m3u8'.format(item['vod_url'], QUALITY_BITRATE[video_quality]['bits'])       
-
-    # Do the second request to get the actual stream data in the correct format
-    request = __create_retry_session().get(url_formatted, stream=False, timeout=5, verify=False, headers=headers)
-    if request is None or not request.status_code == 200 or len(request.text) <= 0:
-      print( "{0} not found on server (second file, pid={1}, url={2})".format(color_title(display_title), pid, url_formatted))
+    # Current RÚV playlists name their renditions e.g. 1080p/stream.m3u8.
+    # Read those advertised URLs instead of guessing an old numeric path.
+    advertised_variants = _playlist_quality_variants(request.text, url_first_file)
+    if advertised_variants:
+      audio_url = _playlist_default_audio_url(request.text, url_first_file)
+      for candidate_quality in quality_candidates:
+        variant = advertised_variants.get(candidate_quality)
+        if variant is None:
+          continue
+        url_formatted = variant['url']
+        stream_request = __create_retry_session().get(url_formatted, stream=False, timeout=5, verify=False, headers=headers)
+        if stream_request is None or stream_request.status_code != 200 or len(stream_request.text) <= 0:
+          print( "{0} quality {1} not found on server (pid={2}, url={3})".format(color_title(display_title), candidate_quality, pid, url_formatted))
+          continue
+        if candidate_quality != video_quality:
+          print("Requested quality {0} is unavailable; using {1} instead.".format(video_quality, candidate_quality))
+        fragments = [line.strip() for line in stream_request.text.splitlines() if len(line) > 1 and line[0] != '#']
+        return {
+          'url': url_formatted,
+          'audio_url': audio_url,
+          'fragments':len(fragments),
+          'quality':candidate_quality,
+        }
       return None
 
-    # Count the number of fragments in the file, used to estimate download time
-    fragments = [line.strip() for line in request.text.splitlines() if len(line) > 1 and line[0] != '#']
+    old_format = request.text.find('.m3u8?tlm=hls&streams') > 0
+    for candidate_quality in quality_candidates:
+      if old_format:
+        url_formatted = '{0}/asset-audio=50000-video={1}.m3u8'.format(item['vod_url'], QUALITY_BITRATE[candidate_quality]['bits'])
+      else:
+        url_formatted = '{0}/{1}/index.m3u8'.format(item['vod_url'], QUALITY_BITRATE[candidate_quality]['code'])
 
-    # We found a playlist file, let's return the url and the fragments
-    return {'url': url_formatted, 'fragments':len(fragments)}
+      stream_request = __create_retry_session().get(url_formatted, stream=False, timeout=5, verify=False, headers=headers)
+      if stream_request is None or stream_request.status_code != 200 or len(stream_request.text) <= 0:
+        print( "{0} quality {1} not found on server (pid={2}, url={3})".format(color_title(display_title), candidate_quality, pid, url_formatted))
+        continue
+
+      if candidate_quality != video_quality:
+        print("Requested quality {0} is unavailable; using {1} instead.".format(video_quality, candidate_quality))
+      fragments = [line.strip() for line in stream_request.text.splitlines() if len(line) > 1 and line[0] != '#']
+      return {'url': url_formatted, 'fragments':len(fragments), 'quality':candidate_quality}
+
+    return None
 
   except Exception as ex:
     print( "Error while discovering playlist for {1} from '{0}'".format(url_formatted, color_title(display_title)))
@@ -549,7 +631,7 @@ def find_m3u8_playlist_url(item, display_title, video_quality):
     return None
 
 # FFMPEG download of the playlist
-def download_m3u8_playlist_using_ffmpeg(ffmpegexec, playlist_url, playlist_fragments, local_filename, display_title, keeppartial, video_quality, disable_metadata, videoInfo):
+def download_m3u8_playlist_using_ffmpeg(ffmpegexec, playlist_url, playlist_fragments, local_filename, display_title, keeppartial, video_quality, disable_metadata, videoInfo, audio_url=None):
   prog_args = [ffmpegexec]
 
   # Don't show copyright header
@@ -568,6 +650,13 @@ def download_m3u8_playlist_using_ffmpeg(ffmpegexec, playlist_url, playlist_fragm
   # Add the input url
   prog_args.append('-i')
   prog_args.append(playlist_url)
+
+  # New RÚV HLS renditions contain video only and advertise Icelandic audio as
+  # a separate playlist in the master file. Add and explicitly map both inputs.
+  if audio_url:
+    prog_args.append('-i')
+    prog_args.append(audio_url)
+    prog_args.extend(['-map', '0:v:0', '-map', '1:a:0'])
 
   # conversion configuration
   prog_args.append('-c')
@@ -768,6 +857,9 @@ def parseArguments():
   parser.add_argument("--includeenglishsubs", help="When set the system will also download entries that have burnt in English subtitles available. This is true for some special schedule items. By default this is off.", 
                                              action="store_true")
 
+  parser.add_argument("--subtitlelanguages", help="Only download subtitle tracks in these language codes. Use 'none' to skip subtitle files.",
+                                             type=str, nargs="+", default=None)
+
   parser.add_argument("--ffmpeg",       help="Full path to the ffmpeg executable file", 
                                         type=str)
 
@@ -878,6 +970,25 @@ def createShowTitle(show, include_original_title=False, use_plex_formatting=Fals
     if( 'original-title' in show and not show['original-title'] is None ):
       show_title = "{0} - {1}".format(sanitizeFileName(show['series_title']), rchop(sanitizeFileName(show['original-title']), [' I', ' II', ' III', ' IV', ' V', ' VI', ' VII', ' VIII', ' IX']))
   
+  # RÚV's "(3 af 3)" suffix describes how many episodes are available now,
+  # not necessarily the final series length. Use stable season/episode naming
+  # for episodic programmes so the same episode does not appear to change from
+  # "3 of 3" to "3 of 4" when another episode is published.
+  elif (
+    'ep_num' in show
+    and show.get('ep_num') is not None
+    and not show.get('is_movie')
+    and not show.get('is_docu')
+    and not show.get('is_sport')
+    and (show.get('multiple_episodes') or int(show.get('ep_total') or 0) > 1)
+  ):
+    season = str(show.get('season_num') or 1).zfill(2)
+    episode = str(show['ep_num']).zfill(2)
+    series_title = sanitizeFileName(show.get('series_title') or show['title'])
+    show_title = f"{series_title} s{season}e{episode}"
+    if include_original_title and show.get('original-title'):
+      show_title = f"{show_title} - {sanitizeFileName(show['original-title'])}"
+
   # If not plex then adhere to the original title flag if set
   elif( include_original_title and 'original-title' in show and not show['original-title'] is None ):
     return "{0} - {1}".format(sanitizeFileName(show['title']), sanitizeFileName(show['original-title']))
@@ -987,7 +1098,7 @@ RE_CAPTURE_VOD_EPNUM_FROM_TITLE = re.compile(r'(?P<ep_num>\d+) af (?P<ep_total>\
 #
 # Downloads the full front page VOD schedule and for each episode in there fetches all available episodes
 # uses the new RUV GraphQL queries
-def getVodSchedule(existing_schedule, args_incremental_refresh=False, imdb_cache=None, imdb_orignal_titles=None):
+def getVodSchedule(existing_schedule, args_incremental_refresh=False, imdb_cache=None, imdb_orignal_titles=None, progress_callback=None):
 
   # Start with getting all the series available on RUV through their API, this gives us basic information about each of the series
   # https://api.ruv.is/api/programs/tv/all
@@ -1031,6 +1142,8 @@ def getVodSchedule(existing_schedule, args_incremental_refresh=False, imdb_cache
 
   completed_programs = 0
   total_programs = len(panels)
+  if progress_callback:
+    progress_callback(completed_programs, total_programs, 'Reading programme list')
   
   print("{0} | Total: {1} series available".format(color_title('Downloading VOD schedule'), total_programs))
   printProgress(completed_programs, total_programs, prefix = 'Reading:', suffix = '', barLength = 25)
@@ -1048,6 +1161,8 @@ def getVodSchedule(existing_schedule, args_incremental_refresh=False, imdb_cache
     if args_incremental_refresh:
       existing_vod_episodes_count = sum(type(schedule[p]) is dict and schedule[p]['sid'] == str(program['id']) for p in schedule)
       if( program['web_available_episodes'] <= existing_vod_episodes_count and existing_vod_episodes_count > 0 ):
+        if progress_callback:
+          progress_callback(completed_programs, total_programs, 'Checking programmes')
         continue
       else:
         existing_vs_new_diff = program['web_available_episodes'] - existing_vod_episodes_count
@@ -1066,6 +1181,8 @@ def getVodSchedule(existing_schedule, args_incremental_refresh=False, imdb_cache
         print(traceback.format_exc())
         continue
     printProgress(completed_programs, total_programs, prefix = 'Reading:', suffix ='', barLength = 25)
+    if progress_callback:
+      progress_callback(completed_programs, total_programs, 'Reading programmes')
 
   return schedule
 
@@ -1704,12 +1821,13 @@ def runMain():
         # Get the correct playlist url
         playlist_data = find_m3u8_playlist_url(item, display_title, args.quality)
         if playlist_data is None:
-          print("Error: Could not download show playlist, not found on server. Try requesting a different video quality.")
+          if item.get('vod_url') and item.get('vod_url_full'):
+            print("Error: RÚV did not provide a working video stream in any available quality.")
           continue
 
         #print(playlist_data
         # Now ask FFMPEG to download and remux all the fragments for us
-        result = download_m3u8_playlist_using_ffmpeg(ffmpegexec, playlist_data['url'], playlist_data['fragments'], local_filename, display_title, args.keeppartial, args.quality, args.nometadata, item)
+        result = download_m3u8_playlist_using_ffmpeg(ffmpegexec, playlist_data['url'], playlist_data['fragments'], local_filename, display_title, args.keeppartial, playlist_data.get('quality', args.quality), args.nometadata, item, playlist_data.get('audio_url'))
         if( not result is None ):
           # if everything was OK then save the pid as successfully downloaded
           appendNewPidAndSavePreviouslyRecordedShows(item['pid'], previously_recorded, previously_recorded_file_name) 
@@ -1725,9 +1843,17 @@ def runMain():
           downloadTVShowPoster(local_filename, display_title, item, Path(args.output))
 
       # Attempt to download any subtitles if available 
-      if not item['subtitles'] is None and len(item['subtitles']) > 0:
+      selected_subtitles = item['subtitles']
+      if args.subtitlelanguages is not None:
+        requested_subtitle_languages = {language.lower() for language in args.subtitlelanguages}
+        selected_subtitles = [] if 'none' in requested_subtitle_languages else [
+          subtitle for subtitle in (item['subtitles'] or [])
+          if str(subtitle.get('name', '')).lower() in requested_subtitle_languages
+        ]
+
+      if selected_subtitles is not None and len(selected_subtitles) > 0:
         try:
-          downloadSubtitlesFiles(item['subtitles'], local_filename, display_title, item)
+          downloadSubtitlesFiles(selected_subtitles, local_filename, display_title, item)
         except Exception as ex:
           print("Error: Could not download subtitle files for item, "+item['title'])
           print(ex)

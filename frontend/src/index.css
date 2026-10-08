@@ -20,3 +20,20 @@ body {
 #root {
   min-height: 100vh;
 }
+
+.poster-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+@media (min-width: 640px) {
+  .poster-grid {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+}
+
+@media (min-width: 1024px) {
+  .poster-grid {
+    grid-template-columns: repeat(var(--poster-columns, 10), minmax(0, 1fr));
+  }
+}
