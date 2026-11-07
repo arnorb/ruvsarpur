@@ -30,9 +30,10 @@ Full stack: `docker compose up -d --build`. The UI is served on `:8080`. Nginx p
 
 ## Architecture
 
-**`gui_api.py` uses `ruvsarpur.py` in two different ways:**
+**`gui_api.py` uses `ruvsarpur.py` in these ways:**
 1. **Imported as a module** for catalogue work: `_load_schedule` calls `getVodSchedule`, `getExistingTvSchedule`, `createFullConfigFileName` and other functions directly, and searching and filtering happen in-process.
-2. **Run as a subprocess** for downloads: `_build_download_command` runs `python ruvsarpur.py --pid … --includeenglishsubs --output …`. Library mode adds `--checklocal --plex`, and web mode adds `--force`. The child is started with `RUVSARPUR_PROGRESS_JSON=1`, which makes `printProgress` emit `RUVSARPUR_PROGRESS:{json}` lines. `ApiRuntime` parses those lines for job progress.
+2. **Run as a subprocess** for downloads: `_build_download_command` runs `python ruvsarpur.py --pid … --includeenglishsubs --output …`. Library mode adds `--checklocal --plex --ignorerecorded`, and web mode adds `--force --norecord`, so browser downloads never enter `prevrecorded.log`. The child is started with `RUVSARPUR_PROGRESS_JSON=1`, which makes `printProgress` emit `RUVSARPUR_PROGRESS:{json}` lines and `emitResult` emit one `RUVSARPUR_RESULT:{json}` line per episode (`downloaded`, `exists`, `recorded` or `failed`). `ApiRuntime` parses the progress lines for job progress, and a library job counts as completed only when its result points to a file that exists. ffmpeg writes to `<name>.mp4.part`, which is renamed only on success, so an interrupted download never looks finished to `--checklocal`.
+3. **`ruvsarpur.py --json <command>`** is the JSON-lines worker for the planned Rust port (`src/sarpur_worker.py`; see `.omc/plans/sarpur-rewrite.md` §3.1).
 
 So when you change a CLI flag or the progress output format, update the API's command builder or its parser to match. When you change a schedule or naming function, the API changes with it.
 
@@ -57,3 +58,4 @@ Routing is a hand-written `if parsed.path == …` chain in `do_GET`/`do_POST`/`d
 - `frontend/node_modules/` and `data/tvschedule.json` are committed to git. Don't stage changes to them by accident.
 - The code style in `ruvsarpur.py` is old upstream style (camelCase, 2-space indents). `gui_api.py` is modern typed Python with 4-space indents. Follow the style of the file you are editing.
 - `docs/` is the old GitHub Pages site for the upstream project (sverrirs/ruvsarpur), not developer documentation.
+- `notes/ui-review-2026-11-07.md` reviews the Download, Library and Follow flows. The HIGH items and the temp-file sweep were fixed in S1 (checked off there); the MEDIUM and LOW items are still open. Check it before changing those flows.
