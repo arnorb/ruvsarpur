@@ -52,6 +52,7 @@ from requests.adapters import HTTPAdapter # For Retrying
 from requests.packages.urllib3.util.retry import Retry # For Retrying
 
 import subprocess # To execute shell commands 
+import signal # To clean up partial downloads when stopped
 from itertools import (takewhile,repeat) # To count lines for the extremely large IMDB files 
 
 # Disable SSL warnings
@@ -735,8 +736,13 @@ def download_m3u8_playlist_using_ffmpeg(ffmpegexec, playlist_url, playlist_fragm
     #prog_args.append("-metadata")
     #prog_args.append("{0}={1}".format('ruvsid', str(videoInfo['sid'])))  #Season identifier
     
-  # Finally the output file path
-  prog_args.append(local_filename)
+  # Finally the output file path. ffmpeg writes to a .part file that is only
+  # renamed to the real name once the download has succeeded, so an interrupted
+  # download never looks like a finished episode to --checklocal.
+  part_filename = local_filename + '.part'
+  prog_args.append('-f')
+  prog_args.append('mp4')
+  prog_args.append(part_filename)
 
   # Force a UTF8 environment for the subprocess so that files with non-ascii characters are read correctly
   # for this to work we must not use the universal line endings parameter
@@ -775,6 +781,12 @@ def download_m3u8_playlist_using_ffmpeg(ffmpegexec, playlist_url, playlist_fragm
       retcode = ret.poll()
   except KeyboardInterrupt:
     ret.terminate()
+    try:
+      ret.wait(timeout=30)
+    except Exception:
+      pass
+    if not keeppartial:
+      removePartialFile(part_filename)
     raise
 
   printProgress(total_chunks, total_chunks, prefix = 'Downloading:', suffix = 'Complete -> {0}'.format(local_filename), barLength = 25, color = False)
@@ -783,8 +795,22 @@ def download_m3u8_playlist_using_ffmpeg(ffmpegexec, playlist_url, playlist_fragm
 
   # If the process returned ok then return the local name otherwise a None to signify an error
   if ret.returncode == 0:
+    os.replace(part_filename, local_filename)
     return local_filename
+  if not keeppartial:
+    removePartialFile(part_filename)
   return None
+
+def removePartialFile(part_filename):
+  try:
+    os.remove(part_filename)
+  except OSError:
+    pass
+
+# Turns SIGTERM (sent when a download is stopped from the web GUI) into a
+# KeyboardInterrupt so the partial file is cleaned up before exiting
+def raiseKeyboardInterruptOnSigterm(signum, frame):
+  raise KeyboardInterrupt()
   
 def printTvShowDetails(args, show):
   if( not 'pid' in show ):
@@ -1630,6 +1656,9 @@ def runMain():
     
     # Construct the argument parser for the commandline
     args = parseArguments()
+
+    if hasattr(signal, 'SIGTERM'):
+      signal.signal(signal.SIGTERM, raiseKeyboardInterruptOnSigterm)
 
     # Get ffmpeg exec
     ffmpegexec = findffmpeg(args.ffmpeg, working_dir)
