@@ -41,7 +41,7 @@ So when you change a CLI flag or the progress output format, update the API's co
 - persisted GUI settings (`gui-settings.json`: watchlist SIDs, auto-download interval, library root plus the shows/movies/sports subfolders, Plex fields)
 - a single-worker download job queue (`download_jobs` + `download_job_order`), with retry, delete and clear
 - a background scheduler thread that auto-downloads watchlist series in library mode
-- schedule refresh status, a poster proxy/cache that only allows the hosts in `POSTER_ALLOWED_HOSTS`, and one-time tokens for `/api/download-file`
+- schedule refresh status, a poster proxy/cache that only allows the hosts in `POSTER_ALLOWED_HOSTS`, and tokens for `/api/download-file` that stay valid for 24 hours (browser jobs carry a `clientId` so each browser saves only its own files; `_web_tmp` is swept after 24 hours)
 
 Routing is a hand-written `if parsed.path == …` chain in `do_GET`/`do_POST`/`do_DELETE` inside `create_handler`.
 
