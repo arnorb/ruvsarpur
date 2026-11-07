@@ -1,7 +1,7 @@
 // frontend/src/App.tsx
-import { type CSSProperties, useEffect, useMemo, useRef, useState } from "react";
+import { type CSSProperties, type ReactNode, useEffect, useMemo, useRef, useState } from "react";
 import { ArrowLeft, Check, Clapperboard, Download, Film, FolderOpen, Languages, Plus, RefreshCw, Search, Settings, Tv, Volleyball, X, XCircle } from "lucide-react";
-import { useNavigate, useParams } from "react-router-dom";
+import { Link, useNavigate, useParams } from "react-router-dom";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 
@@ -87,6 +87,7 @@ type DownloadJob = {
   status: "queued" | "downloading" | "processing" | "completed" | "failed" | "cancelled";
   progress: number; stage: string; message: string; files: DownloadFile[];
   createdAt?: string; startedAt?: string | null; finishedAt?: string | null;
+  clientId?: string | null;
 };
 type RefreshStatus = {
   id: string | null; status: "idle" | "running" | "completed" | "failed";
@@ -125,6 +126,80 @@ function getLibraryDestination(settings: AutoSettings, shows: ShowItem[]): strin
   const root = (settings.libraryRootDir || settings.outputDir || "Library root").replace(/[\\/]+$/, "");
   const child = (subdirectory || "").replace(/^[\\/]+/, "");
   return child ? `${root}/${child}` : root;
+}
+
+const CLIENT_ID_KEY = "ruvsarpur.clientId";
+const HANDLED_JOBS_KEY = "ruvsarpur.handledDownloadJobs";
+const HANDLED_JOBS_LIMIT = 200;
+let memoryClientId: string | null = null;
+
+function getClientId(): string {
+  if (memoryClientId) return memoryClientId;
+  try {
+    const stored = window.localStorage.getItem(CLIENT_ID_KEY);
+    if (stored) {
+      memoryClientId = stored;
+      return stored;
+    }
+  } catch {
+    // localStorage unavailable; fall back to an in-memory id.
+  }
+  const generated = typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
+    ? crypto.randomUUID()
+    : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}-${Math.random().toString(36).slice(2)}`;
+  memoryClientId = generated;
+  try {
+    window.localStorage.setItem(CLIENT_ID_KEY, generated);
+  } catch {
+    // Keep the in-memory id.
+  }
+  return generated;
+}
+
+function loadHandledJobs(): Set<string> {
+  try {
+    const parsed: unknown = JSON.parse(window.localStorage.getItem(HANDLED_JOBS_KEY) ?? "[]");
+    if (Array.isArray(parsed)) return new Set(parsed.filter((id): id is string => typeof id === "string"));
+  } catch {
+    // Ignore unreadable storage.
+  }
+  return new Set();
+}
+
+function persistHandledJobs(handled: Set<string>) {
+  try {
+    window.localStorage.setItem(HANDLED_JOBS_KEY, JSON.stringify(Array.from(handled).slice(-HANDLED_JOBS_LIMIT)));
+  } catch {
+    // Handled ids stay in memory only.
+  }
+}
+
+function ModalDialog({ onClose, className, children }: { onClose: () => void; className: string; children: ReactNode }) {
+  const dialogRef = useRef<HTMLDialogElement>(null);
+  useEffect(() => {
+    const dialog = dialogRef.current;
+    const trigger = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    dialog?.showModal();
+    return () => {
+      dialog?.close();
+      if (trigger?.isConnected) trigger.focus();
+    };
+  }, []);
+  return (
+    <dialog
+      ref={dialogRef}
+      className={`m-auto p-0 text-slate-100 backdrop:bg-black/70 backdrop:backdrop-blur-sm ${className}`}
+      onCancel={(event) => {
+        event.preventDefault();
+        onClose();
+      }}
+      onClick={(event) => {
+        if (event.target === event.currentTarget) onClose();
+      }}
+    >
+      {children}
+    </dialog>
+  );
 }
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? "http://127.0.0.1:8000";
@@ -331,13 +406,14 @@ export default function App() {
     lastRunMessage: null,
   });
   const [isSavingSettings, setIsSavingSettings] = useState(false);
+  const [settingsLoaded, setSettingsLoaded] = useState(false);
   const [statusMessage, setStatusMessage] = useState<string>("");
   const [errorMessage, setErrorMessage] = useState<string>("");
   const [startupGraceElapsed, setStartupGraceElapsed] = useState(false);
   const handledRefreshRef = useRef<string | null>(null);
   const downloadTickerRef = useRef<Record<string, number>>({});
   const downloadFoldersRef = useRef<Record<string, BrowserDirectoryHandle>>({});
-  const handledDownloadJobsRef = useRef<Set<string>>(new Set());
+  const handledDownloadJobsRef = useRef<Set<string>>(loadHandledJobs());
 
   const hasQuery = useMemo(() => query.trim().length > 0, [query]);
   const visibleErrorMessage = useMemo(() => {
@@ -455,7 +531,6 @@ export default function App() {
     [episodesForSelectedSid],
   );
   const selectedPrimaryItem = useMemo(() => episodesForSelectedSid[0] ?? null, [episodesForSelectedSid]);
-  const followedCount = useMemo(() => shows.filter((show) => show.isFollowed).length, [shows]);
 
   const startDownloadTicker = (pid: string) => {
     const existingTicker = downloadTickerRef.current[pid];
@@ -571,7 +646,10 @@ export default function App() {
         if ([502, 503, 504].includes(response.status)) return;
         throw new Error(data.error ?? "Failed to load settings");
       }
-      if (data.settings) setSettings(data.settings);
+      if (data.settings) {
+        setSettings(data.settings);
+        setSettingsLoaded(true);
+      }
       if (data.status) setAutoStatus(data.status);
     } catch (error) {
       const message = error instanceof Error ? error.message : "Unexpected error while loading settings";
@@ -583,14 +661,18 @@ export default function App() {
     setIsSavingSettings(true);
     setErrorMessage("");
     try {
+      const { watchlistSids: _watchlistSids, ...settingsWithoutWatchlist } = settings;
       const response = await fetch(`${API_BASE_URL}/api/settings`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(settings),
+        body: JSON.stringify(settingsWithoutWatchlist),
       });
       const data = await parseApiResponse<{ settings?: AutoSettings; error?: string }>(response);
       if (!response.ok) throw new Error(data.error ?? "Failed to save settings");
-      if (data.settings) setSettings(data.settings);
+      if (data.settings) {
+        const saved = data.settings;
+        setSettings((current) => ({ ...saved, watchlistSids: saved.watchlistSids ?? current.watchlistSids }));
+      }
       setStatusMessage("Automation settings saved.");
     } catch (error) {
       const message = error instanceof Error ? error.message : "Unexpected error while saving settings";
@@ -632,10 +714,6 @@ export default function App() {
   const changePage = (nextPage: number) => {
     setCurrentPage(nextPage);
     window.scrollTo({ top: 0, behavior: "smooth" });
-  };
-
-  const openDetailsPage = (sid: string) => {
-    navigate(`/title/${encodeURIComponent(sid)}`);
   };
 
   const closeDetailsPage = () => {
@@ -758,6 +836,7 @@ export default function App() {
             mode,
             contentType: show.contentType ?? "show",
             subtitleLanguages,
+            clientId: getClientId(),
           }),
         });
         const data = await parseApiResponse<{ message?: string; job?: DownloadJob; error?: string }>(response);
@@ -787,8 +866,9 @@ export default function App() {
         setShows((current) => current.map((show) => completedPids.has(show.pid) ? { ...show, isDownloaded: true } : show));
       }
       for (const job of jobs) {
-        if (job.status !== "completed" || job.mode !== "web" || handledDownloadJobsRef.current.has(job.id)) continue;
+        if (job.status !== "completed" || job.mode !== "web" || job.clientId !== getClientId() || handledDownloadJobsRef.current.has(job.id)) continue;
         handledDownloadJobsRef.current.add(job.id);
+        persistHandledJobs(handledDownloadJobsRef.current);
         const folder = downloadFoldersRef.current[job.id];
         try {
           if (folder) {
@@ -972,7 +1052,7 @@ export default function App() {
     <div className="flex min-h-screen bg-slate-950 text-slate-100">
 
       {/* Left sidebar */}
-      <aside className="sticky top-0 flex h-screen w-44 shrink-0 flex-col border-r border-slate-800 bg-slate-900/80 py-4 px-3">
+      <aside className="sticky top-0 flex h-screen w-14 shrink-0 flex-col border-r border-slate-800 bg-slate-900/80 px-1.5 py-4 md:w-44 md:px-3">
         {/* Logo */}
         <button
           type="button"
@@ -981,7 +1061,7 @@ export default function App() {
           aria-label="Reset RÚV Sarpur view"
         >
           <Clapperboard className="h-6 w-6 shrink-0 text-sky-400" />
-          <span className="text-base font-bold tracking-tight text-slate-100">RÚV Sarpur</span>
+          <span className="sr-only text-base font-bold tracking-tight text-slate-100 md:not-sr-only">RÚV Sarpur</span>
         </button>
 
         {/* Nav items */}
@@ -990,14 +1070,14 @@ export default function App() {
             <button
               key={key}
               onClick={() => handleSidebarSelect(key)}
-              className={`flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-sm font-medium transition-colors ${
+              className={`flex w-full items-center justify-center gap-3 rounded-lg px-3 py-2.5 text-sm font-medium md:justify-start transition-colors ${
                 contentFilter === key
                   ? "bg-sky-600/20 text-sky-300"
                   : "text-slate-400 hover:bg-slate-800 hover:text-slate-100"
               }`}
             >
               <span className="shrink-0">{icon}</span>
-              <span>{label}</span>
+              <span className="sr-only md:not-sr-only">{label}</span>
             </button>
           ))}
         </nav>
@@ -1005,10 +1085,10 @@ export default function App() {
         {/* Settings at bottom */}
         <button
           onClick={() => setShowAutomationSettings(true)}
-          className="flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-sm font-medium text-slate-400 transition-colors hover:bg-slate-800 hover:text-slate-100"
+          className="flex w-full items-center justify-center gap-3 rounded-lg px-3 py-2.5 text-sm font-medium md:justify-start text-slate-400 transition-colors hover:bg-slate-800 hover:text-slate-100"
         >
           <Settings className="h-5 w-5 shrink-0" />
-          <span>Settings</span>
+          <span className="sr-only md:not-sr-only">Settings</span>
         </button>
       </aside>
 
@@ -1016,15 +1096,15 @@ export default function App() {
       <main className="flex min-w-0 flex-1 flex-col">
 
         {/* Top bar */}
-        <header className="flex items-center gap-3 border-b border-slate-800 bg-slate-900/60 px-4 py-3">
+        <header className="flex flex-wrap items-center gap-3 border-b border-slate-800 bg-slate-900/60 px-4 py-3">
           {/* Search */}
           <div className="flex h-9 flex-1 items-center overflow-hidden rounded-md border border-slate-700 bg-slate-800">
-            <Search className="ml-3 h-4 w-4 shrink-0 text-slate-500" />
+            <Search className="ml-3 h-4 w-4 shrink-0 text-slate-400" />
             <Input
               value={query}
               onChange={(event) => setQuery(event.target.value)}
               placeholder="Search by title"
-              className="h-9 border-0 bg-transparent text-slate-100 placeholder:text-slate-500 focus-visible:ring-0 focus-visible:ring-offset-0"
+              className="h-9 border-0 bg-transparent text-slate-100 placeholder:text-slate-400 focus-visible:ring-0 focus-visible:ring-offset-0"
               onKeyDown={(event) => {
                 if (event.key === "Enter") void loadShows(false);
               }}
@@ -1033,7 +1113,7 @@ export default function App() {
               <button
                 type="button"
                 onClick={clearSearch}
-                className="mr-1 rounded-full p-1 text-slate-500 transition-colors hover:bg-slate-700 hover:text-slate-200"
+                className="mr-1 rounded-full p-1 text-slate-400 transition-colors hover:bg-slate-700 hover:text-slate-200"
                 aria-label="Clear search"
                 title="Clear search"
               >
@@ -1087,7 +1167,7 @@ export default function App() {
               {shows.length} episodes
             </span>
             <span className="rounded-full border border-slate-700 bg-slate-800 px-3 py-1 text-slate-300">
-              {followedCount} followed
+              {settings.watchlistSids.length} followed
             </span>
             <span
               className={`rounded-full border px-3 py-1 ${
@@ -1105,20 +1185,27 @@ export default function App() {
             onClick={() => void startScheduleRefresh()}
             disabled={isLoading || refreshStatus.status === "running"}
             size="sm"
-            className="relative h-9 shrink-0 overflow-hidden border border-sky-600/60 bg-sky-600/90 text-sky-50 hover:bg-sky-500"
+            className="relative h-9 shrink-0 overflow-hidden border border-sky-600/60 bg-sky-700 text-white hover:bg-sky-600"
           >
             <span
               className="absolute bottom-0 left-0 h-1 bg-sky-200/40 transition-[width] duration-200"
               style={{ width: `${refreshProgress}%` }}
             />
-            <RefreshCw className={`mr-2 h-4 w-4 ${refreshStatus.status === "running" ? "animate-spin" : ""}`} />
+            <RefreshCw className={`mr-2 h-4 w-4 ${refreshStatus.status === "running" ? "motion-safe:animate-spin" : ""}`} />
             {refreshStatus.status === "running" ? `${refreshStatus.completed}/${refreshStatus.total || "?"}` : "Refresh"}
           </Button>
         </header>
 
+        {settingsLoaded && !settings.autoEnabled && settings.watchlistSids.length > 0 ? (
+          <div role="status" className="mx-4 mt-4 flex flex-wrap items-center gap-3 rounded-lg border border-amber-500/40 bg-amber-500/10 px-4 py-2 text-sm text-amber-200">
+            <span>Not downloading: automation is off.</span>
+            <Button size="sm" className="h-7 bg-sky-700 px-3 text-xs text-white hover:bg-sky-600" onClick={() => setShowAutomationSettings(true)}>Turn on</Button>
+          </div>
+        ) : null}
+
         {!selectedSid ? (
           <div className="flex flex-wrap items-center gap-3 border-b border-slate-800 bg-slate-950/50 px-4 py-2">
-            <span className="text-xs font-medium uppercase tracking-wide text-slate-500">Filters</span>
+            <span className="text-xs font-medium uppercase tracking-wide text-slate-400">Filters</span>
             <details className="group relative">
               <summary className="flex h-8 cursor-pointer list-none items-center rounded-md border border-slate-700 bg-slate-800 px-3 text-sm text-slate-200 hover:bg-slate-700">
                 {selectedCategories.length === 0 ? "All categories" : `${selectedCategories.length} categories`}
@@ -1242,7 +1329,7 @@ export default function App() {
                           onError={() => setImageLoadFailed((current) => ({ ...current, [selectedSid]: true }))}
                         />
                       ) : (
-                        <div className="flex h-full w-full items-center justify-center text-xs font-medium text-slate-500">
+                        <div className="flex h-full w-full items-center justify-center text-xs font-medium text-slate-400">
                           No image
                         </div>
                       )}
@@ -1262,7 +1349,7 @@ export default function App() {
                         size="sm"
                         className={
                           selectedSidFollowed
-                            ? "border border-sky-600/60 bg-sky-600/80 text-sky-50 hover:bg-rose-600/80 hover:border-rose-600/60 hover:text-rose-50"
+                            ? "border border-sky-600/60 bg-sky-700 text-white hover:bg-rose-600/80 hover:border-rose-600/60 hover:text-rose-50"
                             : "border-slate-700 bg-slate-800 text-slate-200 hover:bg-slate-700"
                         }
                         onClick={() => void toggleFollowSid(selectedSid, !selectedSidFollowed)}
@@ -1283,7 +1370,7 @@ export default function App() {
 
                     {selectedContentType === "movie_or_docu" && selectedPrimaryItem ? (
                       <div className="mb-4 space-y-3">
-                        <p className="text-sm text-slate-500">Air date: {formatDate(selectedPrimaryItem.publishedAt)}{formatDuration(selectedPrimaryItem) ? ` · ${formatDuration(selectedPrimaryItem)}` : ""}{formatDateOnly(selectedPrimaryItem.expiresAt) ? ` · expires ${formatDateOnly(selectedPrimaryItem.expiresAt)}` : ""}</p>
+                        <p className="text-sm text-slate-400">Air date: {formatDate(selectedPrimaryItem.publishedAt)}{formatDuration(selectedPrimaryItem) ? ` · ${formatDuration(selectedPrimaryItem)}` : ""}{formatDateOnly(selectedPrimaryItem.expiresAt) ? ` · expires ${formatDateOnly(selectedPrimaryItem.expiresAt)}` : ""}</p>
                         <SubtitleBadges show={selectedPrimaryItem} />
                         {getEpisodeDescription(selectedPrimaryItem) ? (
                           <p className="text-sm leading-relaxed text-slate-300">
@@ -1295,7 +1382,7 @@ export default function App() {
                             variant="secondary"
                             size="sm"
                             onClick={() => openDownloadOptions(selectedPrimaryItem, "web")}
-                            className="relative h-8 overflow-hidden border border-sky-600/60 bg-sky-600/90 text-sky-50 hover:bg-sky-500"
+                            className="relative h-8 overflow-hidden border border-sky-600/60 bg-sky-700 text-white hover:bg-sky-600"
                           >
                             <span
                               className="absolute bottom-0 left-0 h-1 bg-sky-200/50 transition-[width] duration-200"
@@ -1315,14 +1402,14 @@ export default function App() {
                     ) : null}
 
                     {episodesForSelectedSid.length === 0 ? (
-                      <p className="text-sm text-slate-500">No episodes found for this title.</p>
+                      <p className="text-sm text-slate-400">No episodes found for this title.</p>
                     ) : selectedContentType !== "movie_or_docu" ? (
                       <div>
                         <div className="mb-3 flex flex-wrap items-center gap-2 rounded-md border border-slate-800 bg-slate-900/70 p-3">
                           <span className="mr-auto text-sm text-slate-300">{selectedEpisodePids.size} of {episodesForSelectedSid.length} selected</span>
                           <Button variant="outline" size="sm" className="h-8 border-slate-700 bg-slate-800 text-slate-200 hover:bg-slate-700" onClick={() => setSelectedEpisodePids(new Set(episodesForSelectedSid.map((episode) => episode.pid)))}>Select all</Button>
                           <Button variant="outline" size="sm" className="h-8 border-slate-700 bg-slate-800 text-slate-200 hover:bg-slate-700" onClick={() => setSelectedEpisodePids(new Set())}>None</Button>
-                          <Button size="sm" disabled={selectedEpisodePids.size === 0} className="h-8 border border-sky-600/60 bg-sky-600/90 text-sky-50 hover:bg-sky-500" onClick={() => openBatchDownloadOptions("web")}><Download className="mr-2 h-4 w-4" />Download selected</Button>
+                          <Button size="sm" disabled={selectedEpisodePids.size === 0} className="h-8 border border-sky-600/60 bg-sky-700 text-white hover:bg-sky-600" onClick={() => openBatchDownloadOptions("web")}><Download className="mr-2 h-4 w-4" />Download selected</Button>
                           <Button variant="outline" size="sm" disabled={selectedEpisodePids.size === 0} className="h-8 border-slate-700 bg-slate-800 text-slate-200 hover:bg-slate-700" onClick={() => openBatchDownloadOptions("library")}>Library selected</Button>
                         </div>
                         <ul className="space-y-2">
@@ -1344,7 +1431,7 @@ export default function App() {
                             />
                             <div className="min-w-0 flex-1">
                               <p className="truncate font-medium text-slate-100">{episode.title}</p>
-                              <p className="text-sm text-slate-500">{formatDate(episode.publishedAt)}{formatDuration(episode) ? ` · ${formatDuration(episode)}` : ""}{formatDateOnly(episode.expiresAt) ? ` · expires ${formatDateOnly(episode.expiresAt)}` : ""}</p>
+                              <p className="text-sm text-slate-400">{formatDate(episode.publishedAt)}{formatDuration(episode) ? ` · ${formatDuration(episode)}` : ""}{formatDateOnly(episode.expiresAt) ? ` · expires ${formatDateOnly(episode.expiresAt)}` : ""}</p>
                               <SubtitleBadges show={episode} />
                               {getEpisodeDescription(episode) ? (
                                 <p className="mt-1 line-clamp-3 text-sm text-slate-300">{getEpisodeDescription(episode)}</p>
@@ -1355,7 +1442,7 @@ export default function App() {
                                 variant="secondary"
                                 size="sm"
                                 onClick={() => openDownloadOptions(episode, "web")}
-                                className="relative h-8 overflow-hidden border border-sky-600/60 bg-sky-600/90 text-sky-50 hover:bg-sky-500"
+                                className="relative h-8 overflow-hidden border border-sky-600/60 bg-sky-700 text-white hover:bg-sky-600"
                               >
                                 <span
                                   className="absolute bottom-0 left-0 h-1 bg-sky-200/50 transition-[width] duration-200"
@@ -1391,13 +1478,13 @@ export default function App() {
                                 <p className="text-sm font-semibold text-slate-100">
                                   {getGroupTitle(sidShows)}
                                 </p>
-                                <p className="text-xs text-slate-500">{sidShows.length} episode(s)</p>
+                                <p className="text-xs text-slate-400">{sidShows.length} episode(s)</p>
                               </div>
                               <Button
                                 size="sm"
                                 className={
                                   isSidFollowed(sidShows)
-                                    ? "border border-sky-600/60 bg-sky-600/80 text-sky-50 hover:bg-rose-600/80 hover:border-rose-600/60 hover:text-rose-50"
+                                    ? "border border-sky-600/60 bg-sky-700 text-white hover:bg-rose-600/80 hover:border-rose-600/60 hover:text-rose-50"
                                     : "border-slate-700 bg-slate-800 text-slate-200 hover:bg-slate-700"
                                 }
                                 onClick={() => void toggleFollowSid(sid, !isSidFollowed(sidShows))}
@@ -1418,7 +1505,7 @@ export default function App() {
                                 >
                                   <div className="min-w-0 flex-1">
                                     <p className="truncate font-medium text-slate-100">{show.title}</p>
-                                    <p className="text-xs text-slate-500">{formatDate(show.publishedAt)}{formatDuration(show) ? ` · ${formatDuration(show)}` : ""}{formatDateOnly(show.expiresAt) ? ` · expires ${formatDateOnly(show.expiresAt)}` : ""}</p>
+                                    <p className="text-xs text-slate-400">{formatDate(show.publishedAt)}{formatDuration(show) ? ` · ${formatDuration(show)}` : ""}{formatDateOnly(show.expiresAt) ? ` · expires ${formatDateOnly(show.expiresAt)}` : ""}</p>
                                     <SubtitleBadges show={show} />
                                   </div>
 
@@ -1427,7 +1514,7 @@ export default function App() {
                                       variant="secondary"
                                       size="sm"
                                       onClick={() => openDownloadOptions(show, "web")}
-                                      className="relative h-8 overflow-hidden border border-sky-600/60 bg-sky-600/90 text-sky-50 hover:bg-sky-500"
+                                      className="relative h-8 overflow-hidden border border-sky-600/60 bg-sky-700 text-white hover:bg-sky-600"
                                     >
                                       <span
                                         className="absolute bottom-0 left-0 h-1 bg-sky-200/50 transition-[width] duration-200"
@@ -1461,35 +1548,35 @@ export default function App() {
                           {categorizedPageShows[groupType].map(([sid, sidShows]) => (
                             <li
                               key={sid}
-                              className="group cursor-pointer transition-transform hover:-translate-y-0.5"
-                              onClick={() => openDetailsPage(sid)}
+                              className="group motion-safe:transition-transform motion-safe:hover:-translate-y-0.5"
                             >
                               <div className="relative aspect-2/3 overflow-hidden rounded-lg bg-slate-800">
-                                {getGroupPosterUrl(sidShows) && !imageLoadFailed[sid] ? (
-                                  <img
-                                    src={getGroupPosterUrl(sidShows) ?? ""}
-                                    alt={`${getGroupTitle(sidShows)} poster`}
-                                    className="h-full w-full object-cover transition-transform duration-300 group-hover:scale-105"
-                                    loading="lazy"
-                                    onError={() => setImageLoadFailed((current) => ({ ...current, [sid]: true }))}
-                                  />
-                                ) : (
-                                  <div className="flex h-full w-full items-center justify-center text-xs font-medium text-slate-500">
-                                    No image
-                                  </div>
-                                )}
+                                <Link to={`/title/${encodeURIComponent(sid)}`} tabIndex={-1} aria-hidden="true" className="block h-full w-full">
+                                  {getGroupPosterUrl(sidShows) && !imageLoadFailed[sid] ? (
+                                    <img
+                                      src={getGroupPosterUrl(sidShows) ?? ""}
+                                      alt=""
+                                      className="h-full w-full object-cover motion-safe:transition-transform motion-safe:duration-300 motion-safe:group-hover:scale-105"
+                                      loading="lazy"
+                                      onError={() => setImageLoadFailed((current) => ({ ...current, [sid]: true }))}
+                                    />
+                                  ) : (
+                                    <div className="flex h-full w-full items-center justify-center text-xs font-medium text-slate-400">
+                                      No image
+                                    </div>
+                                  )}
+                                </Link>
                                 {/* Follow bar — shown on hover, or always visible when already followed */}
                                 <div
                                   className={`absolute inset-x-0 bottom-0 flex items-center justify-center bg-linear-to-t from-black/90 to-transparent px-2 pb-2 pt-6 transition-opacity duration-200 ${
-                                    isSidFollowed(sidShows) ? "opacity-100" : "opacity-0 group-hover:opacity-100"
+                                    isSidFollowed(sidShows) ? "opacity-100" : "opacity-0 focus-within:opacity-100 group-focus-within:opacity-100 group-hover:opacity-100"
                                   }`}
-                                  onClick={(event) => event.stopPropagation()}
                                 >
                                   <button
                                     onClick={() => void toggleFollowSid(sid, !isSidFollowed(sidShows))}
                                     className={`flex w-full items-center justify-center gap-1.5 rounded-md py-1.5 text-xs font-semibold transition-colors ${
                                       isSidFollowed(sidShows)
-                                        ? "bg-sky-600/90 text-sky-50 hover:bg-rose-600/90 hover:text-rose-50"
+                                        ? "bg-sky-700 text-white hover:bg-rose-600/90 hover:text-rose-50"
                                         : "bg-white/10 text-slate-100 backdrop-blur-sm hover:bg-white/20"
                                     }`}
                                   >
@@ -1508,8 +1595,8 @@ export default function App() {
                                 </div>
                               </div>
                               <div className="pt-2">
-                                <p className="line-clamp-2 text-sm font-semibold text-slate-100">{getGroupTitle(sidShows)}</p>
-                                {sidShows.length === 1 && formatDuration(sidShows[0]) ? <p className="mt-0.5 text-xs text-slate-500">{formatDuration(sidShows[0])}</p> : null}
+                                <Link to={`/title/${encodeURIComponent(sid)}`} className="line-clamp-2 rounded text-sm font-semibold text-slate-100 hover:text-sky-300 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-500">{getGroupTitle(sidShows)}</Link>
+                                {sidShows.length === 1 && formatDuration(sidShows[0]) ? <p className="mt-0.5 text-xs text-slate-400">{formatDuration(sidShows[0])}</p> : null}
                               </div>
                             </li>
                           ))}
@@ -1557,14 +1644,11 @@ export default function App() {
 
       {/* Per-download options */}
       {downloadChoice ? (
-        <div
-          className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4 backdrop-blur-sm"
-          onClick={() => setDownloadChoice(null)}
+        <ModalDialog
+          onClose={() => setDownloadChoice(null)}
+          className="w-[calc(100%-2rem)] max-w-lg rounded-xl border border-slate-700 bg-slate-900 shadow-2xl"
         >
-          <div
-            className="w-full max-w-lg rounded-xl border border-slate-700 bg-slate-900 shadow-2xl"
-            onClick={(event) => event.stopPropagation()}
-          >
+          <div>
             <div className="border-b border-slate-800 p-4">
               <p className="text-lg font-semibold text-slate-100">{downloadChoice.mode === "web" ? "Download to this computer" : "Download to library"}</p>
               <p className="mt-1 line-clamp-2 text-sm text-slate-400">{downloadChoice.shows.length === 1 ? downloadChoice.shows[0].title : `${downloadChoice.shows.length} episodes selected`}</p>
@@ -1608,13 +1692,14 @@ export default function App() {
                     <FolderOpen className="h-4 w-4 text-sky-400" />
                     Save on this computer
                   </div>
-                  <p className="text-xs leading-relaxed text-slate-500">
+                  <p className="text-xs leading-relaxed text-slate-400">
                     {folderPickerAvailable
                       ? defaultDownloadFolder
                         ? `Your remembered default is “${defaultDownloadFolder.name}”. You can also use the browser folder or choose another folder just this once.`
                         : "Use your browser's normal download folder, or choose a different folder specifically for this download. You can set a remembered default under Settings."
                       : "Direct folder selection is unavailable on this browser or connection. Use the browser download below and enable ‘Ask where to save’ in your browser if needed."}
                   </p>
+                  <p className="mt-2 text-xs leading-relaxed text-slate-300">Keep this tab open; the file is saved when the download finishes.</p>
                 </div>
               ) : null}
 
@@ -1625,7 +1710,7 @@ export default function App() {
                     Configured library destination
                   </div>
                   <code className="block break-all rounded bg-slate-950 px-2 py-1.5 text-xs text-sky-200">{getLibraryDestination(settings, downloadChoice.shows)}</code>
-                  <p className="mt-2 text-xs leading-relaxed text-slate-500">This uses the default folder for {downloadChoice.shows[0]?.contentType === "movie_or_docu" ? "movies and documentaries" : downloadChoice.shows[0]?.contentType === "sport" ? "sports" : "shows"}. Change it under Settings.</p>
+                  <p className="mt-2 text-xs leading-relaxed text-slate-400">This uses the default folder for {downloadChoice.shows[0]?.contentType === "movie_or_docu" ? "movies and documentaries" : downloadChoice.shows[0]?.contentType === "sport" ? "sports" : "shows"}. Change it under Settings.</p>
                 </div>
               ) : null}
 
@@ -1641,7 +1726,7 @@ export default function App() {
                   <>
                     {defaultDownloadFolder ? (
                       <Button
-                        className="bg-sky-600 text-white hover:bg-sky-500"
+                        className="bg-sky-700 text-white hover:bg-sky-600"
                         onClick={() => void downloadToDefaultFolder()}
                       >
                         <FolderOpen className="mr-2 h-4 w-4" />
@@ -1657,7 +1742,7 @@ export default function App() {
                     </Button>
                     <Button
                       disabled={!folderPickerAvailable}
-                      className={defaultDownloadFolder ? "border-slate-700 bg-slate-800 text-slate-200 hover:bg-slate-700" : "bg-sky-600 text-white hover:bg-sky-500"}
+                      className={defaultDownloadFolder ? "border-slate-700 bg-slate-800 text-slate-200 hover:bg-slate-700" : "bg-sky-700 text-white hover:bg-sky-600"}
                       variant={defaultDownloadFolder ? "outline" : "default"}
                       onClick={() => void chooseFolderAndDownload()}
                     >
@@ -1667,7 +1752,7 @@ export default function App() {
                   </>
                 ) : (
                   <Button
-                    className="bg-sky-600 text-white hover:bg-sky-500"
+                    className="bg-sky-700 text-white hover:bg-sky-600"
                     onClick={() => void handleDownloads(downloadChoice.shows, "library")}
                   >
                     Download to library
@@ -1676,23 +1761,20 @@ export default function App() {
               </div>
             </div>
           </div>
-        </div>
+        </ModalDialog>
       ) : null}
 
       {/* Settings modal */}
       {showAutomationSettings ? (
-        <div
-          className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4 backdrop-blur-sm"
-          onClick={() => setShowAutomationSettings(false)}
+        <ModalDialog
+          onClose={() => setShowAutomationSettings(false)}
+          className="max-h-[80vh] w-[calc(100%-2rem)] max-w-3xl overflow-hidden rounded-xl border border-slate-800 bg-slate-900 shadow-2xl"
         >
-          <div
-            className="max-h-[80vh] w-full max-w-3xl overflow-hidden rounded-xl border border-slate-800 bg-slate-900 shadow-2xl"
-            onClick={(event) => event.stopPropagation()}
-          >
+          <div>
             <div className="flex items-center justify-between border-b border-slate-800 p-4">
               <div>
                 <p className="text-lg font-semibold text-slate-100">Settings</p>
-                <p className="text-sm text-slate-500">Configure watchlist automation and Plex integration.</p>
+                <p className="text-sm text-slate-400">Configure watchlist automation and Plex integration.</p>
               </div>
               <Button
                 variant="outline"
@@ -1709,7 +1791,7 @@ export default function App() {
                 <div className="flex flex-wrap items-center justify-between gap-3">
                   <div>
                     <p className="text-sm font-medium text-slate-200">Default folder for Download</p>
-                    <p className="mt-1 text-xs text-slate-500">
+                    <p className="mt-1 text-xs text-slate-400">
                       {folderPickerAvailable
                         ? defaultDownloadFolder
                           ? `Currently “${defaultDownloadFolder.name}”. This choice is stored securely by this browser on this computer.`
@@ -1721,7 +1803,7 @@ export default function App() {
                     {defaultDownloadFolder ? (
                       <Button variant="outline" size="sm" className="border-slate-700 bg-slate-800 text-slate-300 hover:bg-slate-700" onClick={() => void forgetDefaultDownloadFolder()}>Forget</Button>
                     ) : null}
-                    <Button size="sm" disabled={!folderPickerAvailable} className="bg-sky-600 text-white hover:bg-sky-500" onClick={() => void chooseDefaultDownloadFolder()}>
+                    <Button size="sm" disabled={!folderPickerAvailable} className="bg-sky-700 text-white hover:bg-sky-600" onClick={() => void chooseDefaultDownloadFolder()}>
                       <FolderOpen className="mr-2 h-4 w-4" />
                       {defaultDownloadFolder ? "Change folder" : "Choose folder"}
                     </Button>
@@ -1766,7 +1848,7 @@ export default function App() {
                   value={settings.libraryRootDir}
                   onChange={(event) => setSettings((current) => ({ ...current, libraryRootDir: event.target.value }))}
                   placeholder="Library root folder, e.g. /data/media/ruv"
-                  className="h-9 border-slate-700 bg-slate-800 text-slate-100 placeholder:text-slate-500"
+                  className="h-9 border-slate-700 bg-slate-800 text-slate-100 placeholder:text-slate-400"
                 />
                 <Input
                   type="number"
@@ -1778,31 +1860,31 @@ export default function App() {
                     }))
                   }
                   placeholder="Auto interval (minutes)"
-                  className="h-9 border-slate-700 bg-slate-800 text-slate-100 placeholder:text-slate-500"
+                  className="h-9 border-slate-700 bg-slate-800 text-slate-100 placeholder:text-slate-400"
                 />
                 <Input
                   value={settings.showsSubdir}
                   onChange={(event) => setSettings((current) => ({ ...current, showsSubdir: event.target.value }))}
                   placeholder="Shows subfolder (under library root)"
-                  className="h-9 border-slate-700 bg-slate-800 text-slate-100 placeholder:text-slate-500"
+                  className="h-9 border-slate-700 bg-slate-800 text-slate-100 placeholder:text-slate-400"
                 />
                 <Input
                   value={settings.moviesSubdir}
                   onChange={(event) => setSettings((current) => ({ ...current, moviesSubdir: event.target.value }))}
                   placeholder="Movies subfolder (under library root)"
-                  className="h-9 border-slate-700 bg-slate-800 text-slate-100 placeholder:text-slate-500"
+                  className="h-9 border-slate-700 bg-slate-800 text-slate-100 placeholder:text-slate-400"
                 />
                 <Input
                   value={settings.sportsSubdir}
                   onChange={(event) => setSettings((current) => ({ ...current, sportsSubdir: event.target.value }))}
                   placeholder="Sports subfolder (under library root)"
-                  className="h-9 border-slate-700 bg-slate-800 text-slate-100 placeholder:text-slate-500"
+                  className="h-9 border-slate-700 bg-slate-800 text-slate-100 placeholder:text-slate-400"
                 />
                 <Input
                   value={settings.plexBaseUrl}
                   onChange={(event) => setSettings((current) => ({ ...current, plexBaseUrl: event.target.value }))}
                   placeholder="Plex base URL, e.g. http://truenas:32400"
-                  className="h-9 border-slate-700 bg-slate-800 text-slate-100 placeholder:text-slate-500"
+                  className="h-9 border-slate-700 bg-slate-800 text-slate-100 placeholder:text-slate-400"
                 />
                 <Input
                   value={settings.plexLibrarySectionId}
@@ -1810,19 +1892,19 @@ export default function App() {
                     setSettings((current) => ({ ...current, plexLibrarySectionId: event.target.value }))
                   }
                   placeholder="Plex library section id"
-                  className="h-9 border-slate-700 bg-slate-800 text-slate-100 placeholder:text-slate-500"
+                  className="h-9 border-slate-700 bg-slate-800 text-slate-100 placeholder:text-slate-400"
                 />
                 <Input
                   value={settings.plexToken}
                   onChange={(event) => setSettings((current) => ({ ...current, plexToken: event.target.value }))}
                   placeholder="Plex token"
-                  className="h-9 border-slate-700 bg-slate-800 text-slate-100 placeholder:text-slate-500"
+                  className="h-9 border-slate-700 bg-slate-800 text-slate-100 placeholder:text-slate-400"
                 />
                 <Input
                   value={settings.plexLibraryPath}
                   onChange={(event) => setSettings((current) => ({ ...current, plexLibraryPath: event.target.value }))}
                   placeholder="Optional Plex path filter"
-                  className="h-9 border-slate-700 bg-slate-800 text-slate-100 placeholder:text-slate-500"
+                  className="h-9 border-slate-700 bg-slate-800 text-slate-100 placeholder:text-slate-400"
                 />
               </div>
               <div className="mt-3">
@@ -1837,7 +1919,7 @@ export default function App() {
               </div>
             </div>
           </div>
-        </div>
+        </ModalDialog>
       ) : null}
 
       {downloadJobs.length > 0 && isDownloadQueueOpen ? (
@@ -1845,7 +1927,7 @@ export default function App() {
           <div className="flex items-center justify-between gap-3 border-b border-slate-800 px-4 py-3">
             <div>
               <p className="text-sm font-semibold text-slate-100">Download queue</p>
-              <p className="text-xs text-slate-500">
+              <p className="text-xs text-slate-400">
                 {downloadJobs.filter((job) => ["queued", "downloading", "processing"].includes(job.status)).length} active or waiting · {downloadJobs.filter((job) => ["completed", "failed", "cancelled"].includes(job.status)).length} finished
               </p>
             </div>
@@ -1883,9 +1965,17 @@ export default function App() {
                 <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-slate-800">
                   <div className={`h-full transition-[width] duration-300 ${job.status === "failed" ? "bg-rose-500" : job.status === "cancelled" ? "bg-slate-500" : "bg-sky-500"}`} style={{ width: `${job.progress}%` }} />
                 </div>
+                {job.mode === "web" && (job.status === "queued" || job.status === "downloading" || job.status === "processing") ? <p className="mt-1 text-xs text-slate-400">Keep this tab open; the file is saved when the download finishes.</p> : null}
                 {job.status === "failed" ? <p className="mt-1 text-xs text-rose-300">{job.message || "The download failed. You can retry it."}</p> : null}
-                {job.status === "cancelled" ? <p className="mt-1 text-xs text-slate-500">Stopped before completion.</p> : null}
-                {job.status === "completed" ? <p className="mt-1 text-xs text-emerald-400/80">Download completed successfully.</p> : null}
+                {job.status === "cancelled" ? <p className="mt-1 text-xs text-slate-400">Stopped before completion.</p> : null}
+                {job.status === "completed" ? (
+                  <p className="mt-1 text-xs text-emerald-400/80">
+                    Download completed successfully.
+                    {job.mode === "web" && job.files.length > 0 ? job.files.map((file) => (
+                      <a key={file.downloadUrl} href={toApiUrl(file.downloadUrl)} download={file.fileName} className="ml-2 text-sky-300 underline hover:text-sky-200">Save again{job.files.length > 1 ? `: ${file.fileName}` : ""}</a>
+                    )) : null}
+                  </p>
+                ) : null}
               </div>
             ))}
           </div>
@@ -1894,7 +1984,7 @@ export default function App() {
 
       {downloadJobs.length > 0 && !isDownloadQueueOpen ? (
         <Button
-          className="fixed bottom-4 right-4 z-40 bg-sky-600 text-white shadow-xl hover:bg-sky-500"
+          className="fixed bottom-4 right-4 z-40 bg-sky-700 text-white shadow-xl hover:bg-sky-600"
           onClick={() => setIsDownloadQueueOpen(true)}
         >
           <Download className="mr-2 h-4 w-4" />

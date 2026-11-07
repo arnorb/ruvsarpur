@@ -833,6 +833,10 @@ def parseArguments():
   parser.add_argument("--plex", help="Creates Plex Media Server compatible file names and folder structures. See https://support.plex.tv/articles/naming-and-organizing-your-tv-show-files/", action="store_true")
 
   parser.add_argument("--force", help="Forces the program to re-download shows", action="store_true")
+
+  parser.add_argument("--norecord", help="Does not add downloaded episodes to the recorded log (used for one-off downloads that should not stop later library downloads)", action="store_true")
+
+  parser.add_argument("--ignorerecorded", help="Downloads episodes even if they are in the recorded log. Existing local files are still respected when --checklocal is set.", action="store_true")
   
   parser.add_argument("--list", help="Only lists the items found but nothing is downloaded", action="store_true")
   
@@ -1071,6 +1075,18 @@ def isLocalFileNameUnique(local_filename):
   fileSearchString = local_filename.split(".mp4")[0]+"*.mp4"
   retval = glob.glob(fileSearchString)
   return not retval
+
+# Emits a machine readable outcome line for each episode when running under the web GUI
+# status is one of: downloaded, exists, recorded, failed
+def emitResult(pid, status, local_filename=None, message=None):
+  if os.getenv("RUVSARPUR_PROGRESS_JSON") != "1":
+    return
+  print("\nRUVSARPUR_RESULT:" + json.dumps({
+    "pid": pid,
+    "status": status,
+    "path": local_filename,
+    "message": message,
+  }), flush=True)
 
 #
 # Locates the ffmpeg executable and returns a full path to it
@@ -1788,8 +1804,9 @@ def runMain():
 
       if not args.novideo:
         # If the file has already been registered as downloaded then don't attempt to re-download
-        if( not args.force and item['pid'] in previously_recorded ):
+        if( not args.force and not args.ignorerecorded and item['pid'] in previously_recorded ):
           print("'{0}' already recorded (pid={1})".format(color_title(display_title), item['pid']))
+          emitResult(item['pid'], 'recorded', local_filename)
           continue
 
         # Before we attempt to download the file we should make sure we're not accidentally overwriting an existing file
@@ -1804,13 +1821,16 @@ def runMain():
               local_filename = "{0}_{1}.mp4".format(local_filename.split(".mp4")[0], str(uuid.uuid4()))
               if( not isLocalFileNameUnique(local_filename)):      
                 print("Error: unabled to create a local file name for '{0}', check your output folder (pid={1})".format(color_title(display_title), item['pid']))
+                emitResult(item['pid'], 'failed', local_filename, 'Could not create a unique file name')
                 continue
 
         # If the checklocal option is enabled then we don't want to try to download unless force is set
         if( not args.force and args.checklocal and not isLocalFileNameUnique(local_filename) ):
           # Store the id as already recorded and save to the file 
           print("'{0}' found locally and marked as already recorded (pid={1})".format(color_title(display_title), item['pid']))
-          appendNewPidAndSavePreviouslyRecordedShows(item['pid'], previously_recorded, previously_recorded_file_name)
+          if not args.norecord and item['pid'] not in previously_recorded:
+            appendNewPidAndSavePreviouslyRecordedShows(item['pid'], previously_recorded, previously_recorded_file_name)
+          emitResult(item['pid'], 'exists', local_filename)
           continue
 
         #############################################
@@ -1823,6 +1843,7 @@ def runMain():
         if playlist_data is None:
           if item.get('vod_url') and item.get('vod_url_full'):
             print("Error: RÚV did not provide a working video stream in any available quality.")
+          emitResult(item['pid'], 'failed', local_filename, 'RÚV did not provide a working video stream')
           continue
 
         #print(playlist_data
@@ -1830,7 +1851,11 @@ def runMain():
         result = download_m3u8_playlist_using_ffmpeg(ffmpegexec, playlist_data['url'], playlist_data['fragments'], local_filename, display_title, args.keeppartial, playlist_data.get('quality', args.quality), args.nometadata, item, playlist_data.get('audio_url'))
         if( not result is None ):
           # if everything was OK then save the pid as successfully downloaded
-          appendNewPidAndSavePreviouslyRecordedShows(item['pid'], previously_recorded, previously_recorded_file_name) 
+          if not args.norecord and item['pid'] not in previously_recorded:
+            appendNewPidAndSavePreviouslyRecordedShows(item['pid'], previously_recorded, previously_recorded_file_name)
+          emitResult(item['pid'], 'downloaded', result)
+        else:
+          emitResult(item['pid'], 'failed', local_filename, 'ffmpeg failed to download the stream')
 
       # Attempt to download artworks if available but only when plex is selected
       if args.novideo:
@@ -1866,4 +1891,7 @@ def runMain():
 
 # If the script file is called by itself then execute the main function
 if __name__ == '__main__':
+  if sys.argv[1:2] == ['--json']:
+    import sarpur_worker
+    sys.exit(sarpur_worker.main(sys.argv[2:]))
   runMain()

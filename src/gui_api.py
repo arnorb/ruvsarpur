@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import datetime
+import glob
 import hashlib
 import json
 import logging
@@ -45,6 +46,11 @@ DOWNLOAD_LOG_FILE = "download-events.log"
 DOWNLOAD_LOGGER_NAME = "ruvsarpur.downloads"
 DOWNLOAD_LOG_MAX_BYTES = 5 * 1024 * 1024
 DOWNLOAD_LOG_BACKUP_COUNT = 5
+WEB_DOWNLOAD_RETENTION = datetime.timedelta(hours=24)
+WEB_DOWNLOAD_SWEEP_INTERVAL_SECONDS = 3600
+ALREADY_RECORDED_MESSAGE = (
+    "Already marked as recorded, but no file is in the library. Retry to download it again."
+)
 
 
 def _default_settings() -> dict:
@@ -146,7 +152,8 @@ class ApiRuntime:
         self.download_logger = self._create_download_logger()
         self.web_download_dir = (Path.cwd() / "downloads" / "_web_tmp").resolve()
         self.web_download_dir.mkdir(parents=True, exist_ok=True)
-        self.web_download_tokens: dict[str, Path] = {}
+        self.web_download_tokens: dict[str, tuple[Path, float]] = {}
+        self._last_web_download_sweep_unix = 0.0
         self.download_jobs: dict[str, dict] = {}
         self.download_job_order: list[str] = []
         self._download_condition = threading.Condition(self._lock)
@@ -160,6 +167,7 @@ class ApiRuntime:
         self._last_poster_cleanup_unix = 0.0
         self._last_auto_run_unix = 0.0
         self._cleanup_poster_cache()
+        self.sweep_web_downloads()
         self._scheduler_thread = threading.Thread(target=self._scheduler_loop, daemon=True)
         self._scheduler_thread.start()
         self._download_worker_thread = threading.Thread(target=self._download_worker, daemon=True)
@@ -216,6 +224,7 @@ class ApiRuntime:
         mode: str,
         content_type: str,
         subtitle_languages: list[str] | None,
+        client_id: str | None = None,
     ) -> dict:
         job_id = uuid.uuid4().hex
         if mode == "web":
@@ -234,6 +243,9 @@ class ApiRuntime:
             "mode": mode,
             "contentType": content_type,
             "subtitleLanguages": subtitle_languages,
+            # Routes a finished browser download to the browser that asked for it.
+            # This is not access control.
+            "clientId": client_id,
             "status": "queued",
             "progress": 0,
             "stage": "Waiting in queue",
@@ -303,6 +315,7 @@ class ApiRuntime:
                 "output_dir": previous["outputDir"], "mode": previous["mode"],
                 "content_type": previous["contentType"],
                 "subtitle_languages": previous.get("subtitleLanguages"),
+                "client_id": previous.get("clientId"),
             }
         return self.enqueue_download(**retry_details)
 
@@ -347,6 +360,7 @@ class ApiRuntime:
         if os.name != "nt":
             popen_kwargs["start_new_session"] = True
         output_tail: list[str] = []
+        results: list[dict] = []
         try:
             process = subprocess.Popen(command, **popen_kwargs)
             with self._lock:
@@ -362,6 +376,13 @@ class ApiRuntime:
                             job["message"] = str(progress.get("suffix") or job["stage"])
                     except Exception:
                         pass
+                elif line.startswith("RUVSARPUR_RESULT:"):
+                    try:
+                        result = json.loads(line.split(":", 1)[1])
+                    except ValueError:
+                        continue
+                    if isinstance(result, dict):
+                        results.append(result)
                 elif line:
                     output_tail = (output_tail + [line])[-8:]
             return_code = process.wait()
@@ -373,16 +394,20 @@ class ApiRuntime:
             if return_code != 0:
                 raise RuntimeError(output_tail[-1] if output_tail else "Download failed")
             files = []
-            if job["mode"] == "web":
+            completed_message = "Download completed"
+            if job["mode"] == "library":
+                completed_message = _library_job_outcome(results, output_tail)
+            else:
                 downloaded_files = _find_download_files(job["outputDir"], job["pid"])
                 if not downloaded_files:
-                    detail = output_tail[-1] if output_tail else "The downloader produced no output."
+                    failure = next((r for r in results if r.get("status") == "failed"), None)
+                    detail = (failure or {}).get("message") or (output_tail[-1] if output_tail else "The downloader produced no output.")
                     raise RuntimeError(f"No video file was produced. {detail}")
                 for downloaded_file in downloaded_files:
                     token = self.register_web_download_file(downloaded_file)
                     files.append({"downloadUrl": f"/api/download-file?token={token}", "fileName": downloaded_file.name, "kind": "video" if downloaded_file == downloaded_files[0] else "subtitle"})
             with self._lock:
-                job.update(status="completed", progress=100, stage="Completed", message="Download completed", files=files, finishedAt=datetime.datetime.utcnow().isoformat() + "Z")
+                job.update(status="completed", progress=100, stage="Completed", message=completed_message, files=files, finishedAt=datetime.datetime.utcnow().isoformat() + "Z")
         except Exception as ex:
             with self._lock:
                 self._active_download_process = None
@@ -524,13 +549,59 @@ class ApiRuntime:
 
     def register_web_download_file(self, file_path: Path) -> str:
         token = uuid.uuid4().hex
+        expires_unix = time.time() + WEB_DOWNLOAD_RETENTION.total_seconds()
         with self._lock:
-            self.web_download_tokens[token] = file_path
+            self.web_download_tokens[token] = (file_path, expires_unix)
         return token
 
-    def pop_web_download_file(self, token: str) -> Path | None:
+    def get_web_download_file(self, token: str) -> Path | None:
+        """Look up a browser download. Links stay valid until the file is swept."""
+        self._maybe_sweep_web_downloads()
         with self._lock:
-            return self.web_download_tokens.pop(token, None)
+            entry = self.web_download_tokens.get(token)
+        if entry is None:
+            return None
+        file_path, expires_unix = entry
+        if time.time() >= expires_unix:
+            return None
+        return file_path
+
+    def _maybe_sweep_web_downloads(self) -> None:
+        if time.time() - self._last_web_download_sweep_unix < WEB_DOWNLOAD_SWEEP_INTERVAL_SECONDS:
+            return
+        self.sweep_web_downloads()
+
+    def sweep_web_downloads(self) -> int:
+        """Delete browser-download folders older than the retention period.
+
+        Folders of jobs that are still queued or running are kept.
+        """
+        now_unix = time.time()
+        self._last_web_download_sweep_unix = now_unix
+        cutoff_unix = now_unix - WEB_DOWNLOAD_RETENTION.total_seconds()
+        with self._lock:
+            active_ids = {
+                job_id for job_id, job in self.download_jobs.items()
+                if job.get("status") in {"queued", "downloading"}
+            }
+            self.web_download_tokens = {
+                token: entry for token, entry in self.web_download_tokens.items()
+                if entry[1] > now_unix
+            }
+        removed = 0
+        if not self.web_download_dir.is_dir():
+            return removed
+        for job_dir in self.web_download_dir.iterdir():
+            if not job_dir.is_dir() or job_dir.name in active_ids:
+                continue
+            try:
+                if job_dir.stat().st_mtime > cutoff_unix:
+                    continue
+                shutil.rmtree(job_dir)
+                removed += 1
+            except OSError:
+                continue
+        return removed
 
     def _load_settings(self) -> dict:
         defaults = _default_settings()
@@ -559,6 +630,10 @@ class ApiRuntime:
     def update_settings(self, patch: dict) -> dict:
         with self._lock:
             for key in _default_settings().keys():
+                # The watchlist has its own endpoint. Accepting it here let a
+                # stale tab wipe follows made elsewhere.
+                if key == "watchlistSids":
+                    continue
                 if key in patch:
                     self.settings[key] = patch[key]
             self.settings["watchlistSids"] = [
@@ -886,17 +961,53 @@ def _build_download_command(
         output_dir,
     ]
     if mode == "library":
+        # An explicit Library download only skips episodes whose file is
+        # already in the library. The recorded log is for automatic runs, so
+        # an earlier browser download can't block it.
         command.append("--checklocal")
         command.append("--plex")
+        command.append("--ignorerecorded")
     else:
-        # Web mode should always materialize a local file in the target folder.
+        # Web mode should always materialize a local file in the target folder,
+        # and must not mark the episode as recorded for the library.
         command.append("--force")
+        command.append("--norecord")
     if portable:
         command.append("--portable")
     if subtitle_languages is not None:
         command.append("--subtitlelanguages")
         command.extend(subtitle_languages if subtitle_languages else ["none"])
     return command
+
+
+def _library_file_exists(path: str) -> bool:
+    """True if the file, or a renamed copy that keeps its name as a prefix, exists.
+
+    Mirrors ruvsarpur's --checklocal prefix match, with glob characters escaped.
+    """
+    if Path(path).is_file():
+        return True
+    stem = path.split(".mp4")[0]
+    return any(Path(match).is_file() for match in glob.glob(glob.escape(stem) + "*.mp4"))
+
+
+def _library_job_outcome(results: list[dict], output_tail: list[str]) -> str:
+    """Return the success message for a library job, or raise if no file reached the library."""
+    if not results:
+        detail = output_tail[-1] if output_tail else "The downloader produced no output."
+        raise RuntimeError(f"No episode was downloaded. {detail}")
+    result = results[-1]
+    status = result.get("status")
+    if status == "recorded":
+        raise RuntimeError(ALREADY_RECORDED_MESSAGE)
+    if status == "failed":
+        raise RuntimeError(str(result.get("message") or "Download failed"))
+    path = str(result.get("path") or "")
+    if status not in {"downloaded", "exists"} or not path or not _library_file_exists(path):
+        raise RuntimeError(f"The download finished but no file is in the library at {path or 'the expected path'}.")
+    if status == "exists":
+        return "Already in the library"
+    return "Download completed"
 
 
 def _run_download(
@@ -1080,7 +1191,7 @@ def create_handler(config: ApiConfig, runtime: ApiRuntime):
                     )
                     _json_response(self, 400, {"error": "Query parameter 'token' is required"})
                     return
-                file_path = runtime.pop_web_download_file(token)
+                file_path = runtime.get_web_download_file(token)
                 if file_path is None or not file_path.exists() or not file_path.is_file():
                     runtime.log_download_event(
                         event="web_download_file",
@@ -1212,6 +1323,7 @@ def create_handler(config: ApiConfig, runtime: ApiRuntime):
             output_dir = str((body or {}).get("outputDir", "")).strip()
             mode = str((body or {}).get("mode", "library")).strip().lower()
             content_type = str((body or {}).get("contentType", "show")).strip().lower()
+            client_id = str((body or {}).get("clientId") or "").strip()[:64] or None
             requested_subtitle_languages = (body or {}).get("subtitleLanguages")
             subtitle_languages: list[str] | None = None
             if requested_subtitle_languages is not None:
@@ -1274,6 +1386,7 @@ def create_handler(config: ApiConfig, runtime: ApiRuntime):
                 mode=mode,
                 content_type=content_type,
                 subtitle_languages=subtitle_languages,
+                client_id=client_id,
             )
             runtime.log_download_event(event="download_request", status="queued", details={"requestId": request_id, "jobId": job["id"], "pid": pid, "mode": mode, "outputDir": output_dir})
             _json_response(self, 202, {"ok": True, "message": "Added to download queue", "job": job})
