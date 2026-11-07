@@ -33,7 +33,7 @@ Full stack: `docker compose up -d --build`. The UI is served on `:8080`. Nginx p
 **`gui_api.py` uses `ruvsarpur.py` in these ways:**
 1. **Imported as a module** for catalogue work: `_load_schedule` calls `getVodSchedule`, `getExistingTvSchedule`, `createFullConfigFileName` and other functions directly, and searching and filtering happen in-process.
 2. **Run as a subprocess** for downloads: `_build_download_command` runs `python ruvsarpur.py --pid … --includeenglishsubs --output …`. Library mode adds `--checklocal --plex --ignorerecorded`, and web mode adds `--force --norecord`, so browser downloads never enter `prevrecorded.log`. The child is started with `RUVSARPUR_PROGRESS_JSON=1`, which makes `printProgress` emit `RUVSARPUR_PROGRESS:{json}` lines and `emitResult` emit one `RUVSARPUR_RESULT:{json}` line per episode (`downloaded`, `exists`, `recorded` or `failed`). `ApiRuntime` parses the progress lines for job progress, and a library job counts as completed only when its result points to a file that exists. ffmpeg writes to `<name>.mp4.part`, which is renamed only on success, so an interrupted download never looks finished to `--checklocal`.
-3. **`ruvsarpur.py --json <command>`** is the JSON-lines worker for the planned Rust port (`src/sarpur_worker.py`; see `.omc/plans/sarpur-rewrite.md` §3.1).
+3. **`ruvsarpur.py --json <command>`** is the JSON-lines worker for the planned Rust port (`src/sarpur_worker.py`; see `docs/plan.md` §3.1 in the sarpur repo, `~/Projects/sarpur`).
 
 So when you change a CLI flag or the progress output format, update the API's command builder or its parser to match. When you change a schedule or naming function, the API changes with it.
 
